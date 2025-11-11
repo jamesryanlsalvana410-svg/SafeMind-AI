@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: safemind-ai-api
+    env: python
+    region: singapore  # or 'oregon', 'frankfurt' — whichever is closer to you
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app"
+    plan: free
