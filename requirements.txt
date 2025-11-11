@@ -5,7 +5,7 @@ Flask-Login==0.6.3
 Flask-Bcrypt==1.0.1
 
 # --- Machine Learning / AI ---
-tensorflow==2.15.0
+tensorflow==2.20.0
 numpy==1.26.4
 pandas==2.2.2
 scikit-learn==1.5.1
