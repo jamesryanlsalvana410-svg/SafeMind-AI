@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
@@ -10,6 +10,7 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.preprocessing.text import tokenizer_from_json
 from tensorflow.keras.layers import LSTM
 import joblib
+import json
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'devkey')
@@ -38,7 +39,7 @@ def lstm_no_time_major(*args, **kwargs):
 # Load Keras model
 model = load_model(model_path, custom_objects={'LSTM': lstm_no_time_major})
 
-# Load tokenizer from JSON
+# Load tokenizer
 with open(tokenizer_path, 'r', encoding='utf-8') as f:
     tokenizer = tokenizer_from_json(f.read())
 
@@ -135,10 +136,38 @@ def analyze():
     flash(f'AI Prediction: {severity} (PHQ-9 total: {total})')
     return redirect(url_for('dashboard'))
 
+# -------------------- NEW POST API ROUTE --------------------
+@app.route('/predict', methods=['POST'])
+def predict_api():
+    try:
+        data = request.get_json()
+        if not data or 'text' not in data or 'answers' not in data:
+            return jsonify({'error': 'Missing "text" or "answers" in JSON body'}), 400
+
+        text = data['text']
+        answers = data['answers']
+
+        # Preprocess
+        scaled = np.array([answers]).reshape(1, -1)
+        scaled = scaler.transform(scaled)
+
+        seq = tokenizer.texts_to_sequences([text])
+        seq = pad_sequences(seq, maxlen=MAX_LEN)
+
+        # Predict
+        pred = model.predict([seq, scaled])
+        severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
+
+        return jsonify({
+            'severity': severity,
+            'confidence': float(np.max(pred))
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # -------------------- APP RUN --------------------
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 5000))  # Render provides a port
+    port = int(os.environ.get("PORT", 5000))
     with app.app_context():
         db.create_all()
     app.run(host="0.0.0.0", port=port)
