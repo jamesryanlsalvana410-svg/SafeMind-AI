@@ -3,12 +3,6 @@ venv/
 __pycache__/
 *.pyc
 
-# --- Data and Model Files ---
-*.csv
-*.h5
-*.json
-model/
-
 # --- Logs & Temp Files ---
 *.log
 *.tmp

@@ -1,0 +1,41 @@
+{
+  "text_cols": [
+    "Timestamp",
+    "Email Address",
+    "Name: (Last Name, First Name Middle Initial.)\n(eg. Dela Cruz, Juan G.)",
+    "Status: Student or Working ",
+    "Course / Job: ",
+    "Year Level / Years Working: ",
+    "How would you describe your emotional state during the past two weeks?  ",
+    "What situations or experiences make you feel most hopeless or disinterested?  ",
+    "What kinds of things make you feel anxious or worried, and how do you handle them?",
+    "How has anxiety affected your daily activities or interactions with others?",
+    "Can you describe times when you felt unusually energetic or driven to take on new activities?",
+    "How do these changes in energy or activity level affect your relationships or responsibilities?",
+    "Have you noticed any recurring physical discomfort (such as headaches or body pain)? What do you think causes them?",
+    "How do your physical sensations or health concerns influence your emotions or thoughts?",
+    "How has your sleep pattern changed recently, and what do you think affects it?",
+    "What do you notice about your energy or motivation during the day?"
+  ],
+  "num_cols": [
+    "I easily get irritated or frustrated with others. ",
+    "I have little interest or pleasure in doing things I used to enjoy. ",
+    "I avoid situations that make me feel anxious.",
+    "I frequently feel nervous, anxious, or on edge. ",
+    "I start more projects or take more risks than usual.",
+    "I sleep less but still have a lot of energy.",
+    "I experience unexplained aches or pains such as headaches, back pain, or stomach pain.",
+    "I feel my medical problems or symptoms are not taken seriously enough by others.",
+    "I have trouble sleeping, or my sleep does not feel restful.",
+    "I often feel too tired to complete my usual tasks."
+  ],
+  "tokenizer_params": {
+    "num_words": 10000,
+    "max_len": 100
+  },
+  "label_classes": [
+    "high",
+    "low",
+    "moderate"
+  ]
+}
