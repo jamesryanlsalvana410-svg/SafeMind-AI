@@ -10,6 +10,7 @@ from tensorflow.keras.preprocessing.text import tokenizer_from_json
 from tensorflow.keras.layers import LSTM
 import joblib
 import json
+import threading  # <-- Added for async Firestore writes
 
 # -------------------- APP SETUP --------------------
 app = Flask(__name__)
@@ -42,6 +43,19 @@ le = joblib.load(le_path)
 
 MAX_LEN = 100
 print("✅ Model and preprocessing objects loaded successfully!")
+
+# -------------------- FIRESTORE ASYNC HELPER --------------------
+def save_prediction_async(text, severity, confidence):
+    """Save prediction to Firestore asynchronously."""
+    try:
+        db.collection('api_predictions').add({
+            'text': text,
+            'severity': severity,
+            'confidence': confidence,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        print("Error saving prediction:", e)
 
 # -------------------- ROUTES --------------------
 @app.route('/')
@@ -102,12 +116,11 @@ def predict_api():
         answers = answers[:SCALER_FEATURES]  # truncate if too long
 
         # Scale input
-        scaled = scaler.transform(np.array([answers]))  # shape (1, SCALER_FEATURES)
+        scaled = scaler.transform(np.array([answers]))
 
         # ---------------- Pad scaled for model ----------------
         MODEL_FEATURES = 10  # number of features model expects
         if scaled.shape[1] < MODEL_FEATURES:
-            # append dummy 0 for missing features
             scaled = np.append(scaled, np.zeros((1, MODEL_FEATURES - scaled.shape[1])), axis=1)
 
         # ---------------- Process text ----------------
@@ -119,17 +132,14 @@ def predict_api():
         severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
         confidence = float(np.max(pred))
 
-        # ---------------- Store prediction in Firestore ----------------
-        db.collection('api_predictions').add({
-            'text': text,
-            'severity': severity,
-            'confidence': confidence,
-            'timestamp': datetime.utcnow().isoformat()
-        })
+        # ---------------- Save prediction asynchronously ----------------
+        threading.Thread(target=save_prediction_async, args=(text, severity, confidence)).start()
 
+        # Immediately return response to client
         return jsonify({
             'severity': severity,
-            'confidence': confidence
+            'confidence': confidence,
+            'message': 'Prediction stored asynchronously'
         })
 
     except Exception as e:
