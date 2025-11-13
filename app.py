@@ -6,25 +6,27 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.preprocessing.text import tokenizer_from_json  # Fixed import
+from tensorflow.keras.preprocessing.text import tokenizer_from_json
 from tensorflow.keras.layers import LSTM
 import joblib
 import threading
+import redis
+import hashlib
+import json
 
 # -------------------- APP SETUP --------------------
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'devkey')
 
 # -------------------- FIREBASE INIT --------------------
-try:
-    cred = credentials.Certificate("firebase-key.json")
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    print("✅ Firebase connected successfully.")
-except Exception as e:
-    db = None
-    print("⚠️ Firebase connection failed:", e)
+cred = credentials.Certificate("firebase-key.json")
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+# -------------------- REDIS INIT --------------------
+REDIS_URL = os.getenv("REDIS_URL")  # e.g., rediss://default:xxx@host:6379
+cache = redis.from_url(REDIS_URL)
 
 # -------------------- MODEL LOADING --------------------
 MODEL_DIR = "model"
@@ -38,7 +40,6 @@ for path in [model_path, tokenizer_path, scaler_path, le_path]:
         raise FileNotFoundError(f"🚨 Missing required model file: {path}")
 
 def lstm_no_time_major(*args, **kwargs):
-    """Compatibility fix for Keras LSTM layers."""
     kwargs.pop("time_major", None)
     return LSTM(*args, **kwargs)
 
@@ -53,15 +54,12 @@ le = joblib.load(le_path)
 MAX_LEN = 100
 SCALER_FEATURES = 9
 MODEL_FEATURES = 10
+CACHE_TTL = 3600  # seconds, cache for 1 hour
 
 print("✅ Model and preprocessing objects loaded successfully!")
 
 # -------------------- FIRESTORE ASYNC HELPER --------------------
 def save_prediction_async(text, severity, confidence):
-    """Save prediction to Firestore asynchronously."""
-    if not db:
-        print("⚠️ Firestore not initialized — skipping save.")
-        return
     try:
         db.collection("api_predictions").add({
             "text": text,
@@ -69,7 +67,6 @@ def save_prediction_async(text, severity, confidence):
             "confidence": confidence,
             "timestamp": datetime.utcnow().isoformat()
         })
-        print(f"📝 Saved prediction for text: {text[:30]}...")
     except Exception as e:
         print("❌ Error saving prediction:", e)
 
@@ -80,44 +77,56 @@ def index():
 
 @app.route("/dashboard")
 def dashboard():
-    """Displays PHQ-9 assessment results stored in Firestore."""
-    if not db:
-        flash("Firestore not connected.", "error")
-        return render_template("phq9.html", assessments=[])
-    
     assessments_ref = db.collection("assessments").stream()
     assessments = [{**a.to_dict(), "id": a.id} for a in assessments_ref]
     return render_template("phq9.html", assessments=assessments)
 
+# -------------------- ANALYZE ROUTE WITH REDIS CACHING --------------------
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    """Handles PHQ-9 form submissions from frontend."""
     text = request.form.get("text", "")
     answers = [int(request.form.get(f"q{i}", 0)) for i in range(1, 10)]
     total = sum(answers)
 
-    scaled = np.array([answers]).reshape(1, -1)
-    scaled = scaler.transform(scaled)
-    seq = tokenizer.texts_to_sequences([text])
-    seq = pad_sequences(seq, maxlen=MAX_LEN)
+    # ---------------- Generate cache key ----------------
+    cache_key = hashlib.sha256(json.dumps({"text": text, "answers": answers}).encode()).hexdigest()
 
-    pred = model.predict([seq, scaled])
-    severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
+    # ---------------- Check Redis cache ----------------
+    cached = cache.get(cache_key)
+    if cached:
+        result = json.loads(cached)
+        severity = result['severity']
+        total = result['score']
+    else:
+        # Preprocess inputs
+        scaled = np.array([answers]).reshape(1, -1)
+        scaled = scaler.transform(scaled)
+        seq = tokenizer.texts_to_sequences([text])
+        seq = pad_sequences(seq, maxlen=MAX_LEN)
 
-    if db:
-        db.collection("assessments").add({
-            "text": text,
+        # Predict severity
+        pred = model.predict([seq, scaled])
+        severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
+
+        # Prepare result and cache
+        result = {
             "severity": severity,
-            "score": float(total),
-            "created_at": datetime.utcnow().isoformat()
-        })
+            "score": total
+        }
+        cache.setex(cache_key, CACHE_TTL, json.dumps(result))
+
+    # Save to Firestore asynchronously
+    threading.Thread(
+        target=save_prediction_async,
+        args=(text, severity, float(np.max(pred)))
+    ).start()
 
     flash(f"AI Prediction: {severity} (PHQ-9 total: {total})")
     return redirect(url_for("dashboard"))
 
+# -------------------- API PREDICT ROUTE --------------------
 @app.route("/predict", methods=["POST"])
 def predict_api():
-    """API endpoint for external predictions."""
     try:
         data = request.get_json(force=True)
         if not data or "text" not in data or "answers" not in data:
@@ -126,31 +135,38 @@ def predict_api():
         text = data["text"]
         answers = data["answers"]
 
-        # Pad or truncate to match scaler features
+        # Pad answers for scaler/model
         answers = (answers + [0] * SCALER_FEATURES)[:SCALER_FEATURES]
         scaled = scaler.transform(np.array([answers]))
-
-        # Pad for model if necessary
         if scaled.shape[1] < MODEL_FEATURES:
             scaled = np.append(scaled, np.zeros((1, MODEL_FEATURES - scaled.shape[1])), axis=1)
-
-        # Tokenize text input
         seq = tokenizer.texts_to_sequences([text])
         seq = pad_sequences(seq, maxlen=MAX_LEN)
 
-        # Prediction
+        # Generate Redis cache key
+        cache_key = hashlib.sha256(json.dumps({"text": text, "answers": answers}).encode()).hexdigest()
+        cached = cache.get(cache_key)
+        if cached:
+            return jsonify(json.loads(cached))
+
+        # Predict
         pred = model.predict([seq, scaled])
         severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
         confidence = float(np.max(pred))
 
-        # Save asynchronously
+        # Async Firestore save
         threading.Thread(target=save_prediction_async, args=(text, severity, confidence)).start()
 
-        return jsonify({
+        response = {
             "severity": severity,
             "confidence": confidence,
             "message": "Prediction stored asynchronously"
-        })
+        }
+
+        # Store in Redis
+        cache.setex(cache_key, CACHE_TTL, json.dumps(response))
+
+        return jsonify(response)
 
     except Exception as e:
         print("❌ API Error:", e)

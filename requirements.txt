@@ -19,3 +19,4 @@ gunicorn==21.2.0  # Required for Render (production web server)
 python-dotenv==1.0.1
 
 firebase-admin
+redis
