@@ -6,7 +6,6 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.preprocessing.text import tokenizer_from_json
 from tensorflow.keras.layers import LSTM
 import joblib
 import threading
@@ -28,34 +27,53 @@ db = firestore.client()
 REDIS_URL = os.getenv("REDIS_URL")  # e.g., rediss://default:xxx@host:6379
 cache = redis.from_url(REDIS_URL)
 
-# -------------------- MODEL LOADING --------------------
+# -------------------- MODEL VARIABLES --------------------
 MODEL_DIR = "model"
 model_path = os.path.join(MODEL_DIR, "safemind_model.h5")
 tokenizer_path = os.path.join(MODEL_DIR, "tokenizer.json")
 scaler_path = os.path.join(MODEL_DIR, "scaler.pkl")
 le_path = os.path.join(MODEL_DIR, "label_encoder.pkl")
 
-for path in [model_path, tokenizer_path, scaler_path, le_path]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"🚨 Missing required model file: {path}")
+MAX_LEN = 100
+SCALER_FEATURES = 9
+MODEL_FEATURES = 10
+CACHE_TTL = 3600  # 1 hour
+
+# -------------------- LAZY LOADING --------------------
+_model = None
+_tokenizer = None
+_scaler = None
+_le = None
 
 def lstm_no_time_major(*args, **kwargs):
     kwargs.pop("time_major", None)
     return LSTM(*args, **kwargs)
 
-model = load_model(model_path, custom_objects={"LSTM": lstm_no_time_major})
-with open(tokenizer_path, "r", encoding="utf-8") as f:
-    tokenizer = tokenizer_from_json(f.read())
+def get_model():
+    global _model
+    if _model is None:
+        _model = load_model(model_path, custom_objects={"LSTM": lstm_no_time_major})
+    return _model
 
-scaler = joblib.load(scaler_path)
-le = joblib.load(le_path)
+def get_tokenizer():
+    global _tokenizer
+    if _tokenizer is None:
+        from tensorflow.keras.preprocessing.text import tokenizer_from_json
+        with open(tokenizer_path, "r", encoding="utf-8") as f:
+            _tokenizer = tokenizer_from_json(f.read())
+    return _tokenizer
 
-MAX_LEN = 100
-SCALER_FEATURES = 9
-MODEL_FEATURES = 10
-CACHE_TTL = 3600  # 1 hour cache
+def get_scaler():
+    global _scaler
+    if _scaler is None:
+        _scaler = joblib.load(scaler_path)
+    return _scaler
 
-print("✅ Model and preprocessing objects loaded successfully!")
+def get_label_encoder():
+    global _le
+    if _le is None:
+        _le = joblib.load(le_path)
+    return _le
 
 # -------------------- FIRESTORE ASYNC HELPER --------------------
 def save_prediction_async(text, severity, confidence):
@@ -100,15 +118,15 @@ def analyze():
     else:
         # Pad and scale
         answers = (answers + [0] * SCALER_FEATURES)[:SCALER_FEATURES]
-        scaled = scaler.transform(np.array([answers]))
+        scaled = get_scaler().transform(np.array([answers]))
         if scaled.shape[1] < MODEL_FEATURES:
             scaled = np.append(scaled, np.zeros((1, MODEL_FEATURES - scaled.shape[1])), axis=1)
-        seq = tokenizer.texts_to_sequences([text])
+        seq = get_tokenizer().texts_to_sequences([text])
         seq = pad_sequences(seq, maxlen=MAX_LEN)
 
         # Predict
-        pred = model.predict([seq, scaled])
-        severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
+        pred = get_model().predict([seq, scaled])
+        severity = get_label_encoder().inverse_transform(np.argmax(pred, axis=1))[0]
         confidence = float(np.max(pred))
 
         # Async save
@@ -140,10 +158,10 @@ def predict_api():
 
         # Pad answers
         answers = (answers + [0] * SCALER_FEATURES)[:SCALER_FEATURES]
-        scaled = scaler.transform(np.array([answers]))
+        scaled = get_scaler().transform(np.array([answers]))
         if scaled.shape[1] < MODEL_FEATURES:
             scaled = np.append(scaled, np.zeros((1, MODEL_FEATURES - scaled.shape[1])), axis=1)
-        seq = tokenizer.texts_to_sequences([text])
+        seq = get_tokenizer().texts_to_sequences([text])
         seq = pad_sequences(seq, maxlen=MAX_LEN)
 
         # Redis cache key
@@ -153,8 +171,8 @@ def predict_api():
             return jsonify(json.loads(cached))
 
         # Predict
-        pred = model.predict([seq, scaled])
-        severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
+        pred = get_model().predict([seq, scaled])
+        severity = get_label_encoder().inverse_transform(np.argmax(pred, axis=1))[0]
         confidence = float(np.max(pred))
 
         # Async save
