@@ -4,13 +4,9 @@ import os
 import numpy as np
 import firebase_admin
 from firebase_admin import credentials, firestore
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.preprocessing.text import tokenizer_from_json
-from tensorflow.keras.layers import LSTM
 import joblib
 import json
-import threading  # <-- Added for async Firestore writes
+import threading  # for async Firestore writes
 
 # -------------------- APP SETUP --------------------
 app = Flask(__name__)
@@ -21,28 +17,45 @@ cred = credentials.Certificate("firebase-key.json")
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# -------------------- MODEL LOADING --------------------
+# -------------------- MODEL CONFIG --------------------
 model_path = 'model/safemind_model.h5'
 tokenizer_path = 'model/tokenizer.json'
 scaler_path = 'model/scaler.pkl'
 le_path = 'model/label_encoder.pkl'
-
-for path in [model_path, tokenizer_path, scaler_path, le_path]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"🚨 Required file not found: {path}")
-
-def lstm_no_time_major(*args, **kwargs):
-    kwargs.pop('time_major', None)
-    return LSTM(*args, **kwargs)
-
-model = load_model(model_path, custom_objects={'LSTM': lstm_no_time_major})
-with open(tokenizer_path, 'r', encoding='utf-8') as f:
-    tokenizer = tokenizer_from_json(f.read())
-scaler = joblib.load(scaler_path)
-le = joblib.load(le_path)
-
 MAX_LEN = 100
-print("✅ Model and preprocessing objects loaded successfully!")
+
+# 🔹 Lazy load cache
+_model = None
+_tokenizer = None
+_scaler = None
+_le = None
+
+# -------------------- HELPER: Load model lazily --------------------
+def get_model_components():
+    """Load model and preprocessing objects only when needed."""
+    global _model, _tokenizer, _scaler, _le
+
+    if _model is None or _tokenizer is None or _scaler is None or _le is None:
+        from tensorflow.keras.models import load_model
+        from tensorflow.keras.preprocessing.sequence import pad_sequences
+        from tensorflow.keras.preprocessing.text import tokenizer_from_json
+        from tensorflow.keras.layers import LSTM
+
+        # Fix for 'time_major' argument in custom LSTM
+        def lstm_no_time_major(*args, **kwargs):
+            kwargs.pop('time_major', None)
+            return LSTM(*args, **kwargs)
+
+        print("⏳ Loading AI model and preprocessing components...")
+        _model = load_model(model_path, custom_objects={'LSTM': lstm_no_time_major})
+        with open(tokenizer_path, 'r', encoding='utf-8') as f:
+            _tokenizer = tokenizer_from_json(f.read())
+        _scaler = joblib.load(scaler_path)
+        _le = joblib.load(le_path)
+        print("✅ Model and preprocessing objects loaded successfully!")
+
+    return _model, _tokenizer, _scaler, _le
+
 
 # -------------------- FIRESTORE ASYNC HELPER --------------------
 def save_prediction_async(text, severity, confidence):
@@ -55,22 +68,21 @@ def save_prediction_async(text, severity, confidence):
             'timestamp': datetime.utcnow().isoformat()
         })
     except Exception as e:
-        print("Error saving prediction:", e)
+        print("⚠️ Error saving prediction:", e)
+
 
 # -------------------- ROUTES --------------------
 @app.route('/')
 def index():
     return redirect(url_for('dashboard'))
 
+
 @app.route('/dashboard')
 def dashboard():
-    # Retrieve assessments from Firestore
     assessments_ref = db.collection('assessments').stream()
-    assessments = [
-        {**a.to_dict(), 'id': a.id}
-        for a in assessments_ref
-    ]
+    assessments = [{**a.to_dict(), 'id': a.id} for a in assessments_ref]
     return render_template('phq9.html', assessments=assessments)
+
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -78,9 +90,13 @@ def analyze():
     answers = [int(request.form.get(f'q{i}')) for i in range(1, 10)]
     total = sum(answers)
 
+    # Lazy load model components
+    model, tokenizer, scaler, le = get_model_components()
+
     # Preprocess inputs
     scaled = np.array([answers]).reshape(1, -1)
     scaled = scaler.transform(scaled)
+    from tensorflow.keras.preprocessing.sequence import pad_sequences
     seq = tokenizer.texts_to_sequences([text])
     seq = pad_sequences(seq, maxlen=MAX_LEN)
 
@@ -99,6 +115,7 @@ def analyze():
     flash(f'AI Prediction: {severity} (PHQ-9 total: {total})')
     return redirect(url_for('dashboard'))
 
+
 @app.route('/predict', methods=['POST'])
 def predict_api():
     try:
@@ -109,33 +126,36 @@ def predict_api():
         text = data['text']
         answers = data['answers']
 
-        # ---------------- Pad answers for scaler ----------------
-        SCALER_FEATURES = 9  # number of features scaler expects
-        while len(answers) < SCALER_FEATURES:
-            answers.append(0)  # pad missing features with 0
-        answers = answers[:SCALER_FEATURES]  # truncate if too long
+        # Lazy load model components
+        model, tokenizer, scaler, le = get_model_components()
+        from tensorflow.keras.preprocessing.sequence import pad_sequences
 
-        # Scale input
+        # Normalize answers length
+        SCALER_FEATURES = 9
+        while len(answers) < SCALER_FEATURES:
+            answers.append(0)
+        answers = answers[:SCALER_FEATURES]
+
+        # Scale numeric input
         scaled = scaler.transform(np.array([answers]))
 
-        # ---------------- Pad scaled for model ----------------
-        MODEL_FEATURES = 10  # number of features model expects
+        # Ensure correct input shape for model
+        MODEL_FEATURES = 10
         if scaled.shape[1] < MODEL_FEATURES:
             scaled = np.append(scaled, np.zeros((1, MODEL_FEATURES - scaled.shape[1])), axis=1)
 
-        # ---------------- Process text ----------------
+        # Process text
         seq = tokenizer.texts_to_sequences([text])
         seq = pad_sequences(seq, maxlen=MAX_LEN)
 
-        # ---------------- Predict ----------------
+        # Predict
         pred = model.predict([seq, scaled])
         severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
         confidence = float(np.max(pred))
 
-        # ---------------- Save prediction asynchronously ----------------
+        # Save prediction asynchronously
         threading.Thread(target=save_prediction_async, args=(text, severity, confidence)).start()
 
-        # Immediately return response to client
         return jsonify({
             'severity': severity,
             'confidence': confidence,
@@ -144,6 +164,7 @@ def predict_api():
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 # -------------------- APP RUN --------------------
 if __name__ == "__main__":
