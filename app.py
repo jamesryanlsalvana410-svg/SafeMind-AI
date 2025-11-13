@@ -4,12 +4,12 @@ import os
 import numpy as np
 import firebase_admin
 from firebase_admin import credentials, firestore
-import joblib
-import json
-import threading
 from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.sequence import pad_sequences, tokenizer_from_json
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.preprocessing.text import tokenizer_from_json  # Fixed import
 from tensorflow.keras.layers import LSTM
+import joblib
+import threading
 
 # -------------------- APP SETUP --------------------
 app = Flask(__name__)
@@ -17,50 +17,50 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'devkey')
 
 # -------------------- FIREBASE INIT --------------------
 try:
-    # Use environment variable for Render safety (avoid storing firebase-key.json in repo)
-    firebase_json = os.getenv("FIREBASE_KEY_JSON")
-    if firebase_json:
-        cred_dict = json.loads(firebase_json)
-        cred = credentials.Certificate(cred_dict)
-    else:
-        cred = credentials.Certificate("firebase-key.json")
-
-    firebase_admin.initialize_app(cred)
+    cred = credentials.Certificate("firebase-key.json")
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred)
     db = firestore.client()
-    print("✅ Firebase initialized successfully.")
+    print("✅ Firebase connected successfully.")
 except Exception as e:
-    print("⚠️ Firebase initialization failed:", e)
     db = None
+    print("⚠️ Firebase connection failed:", e)
 
-# -------------------- MODEL CONFIG --------------------
-MODEL_PATH = "model/safemind_model.h5"
-TOKENIZER_PATH = "model/tokenizer.json"
-SCALER_PATH = "model/scaler.pkl"
-LE_PATH = "model/label_encoder.pkl"
+# -------------------- MODEL LOADING --------------------
+MODEL_DIR = "model"
+model_path = os.path.join(MODEL_DIR, "safemind_model.h5")
+tokenizer_path = os.path.join(MODEL_DIR, "tokenizer.json")
+scaler_path = os.path.join(MODEL_DIR, "scaler.pkl")
+le_path = os.path.join(MODEL_DIR, "label_encoder.pkl")
+
+for path in [model_path, tokenizer_path, scaler_path, le_path]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"🚨 Missing required model file: {path}")
+
+def lstm_no_time_major(*args, **kwargs):
+    """Compatibility fix for Keras LSTM layers."""
+    kwargs.pop("time_major", None)
+    return LSTM(*args, **kwargs)
+
+model = load_model(model_path, custom_objects={"LSTM": lstm_no_time_major})
+
+with open(tokenizer_path, "r", encoding="utf-8") as f:
+    tokenizer = tokenizer_from_json(f.read())
+
+scaler = joblib.load(scaler_path)
+le = joblib.load(le_path)
+
 MAX_LEN = 100
+SCALER_FEATURES = 9
+MODEL_FEATURES = 10
 
-# -------------------- LOAD MODEL ON STARTUP --------------------
-print("⏳ Loading AI model and preprocessing components...")
-try:
-    # Fix for LSTM time_major bug
-    def lstm_no_time_major(*args, **kwargs):
-        kwargs.pop("time_major", None)
-        return LSTM(*args, **kwargs)
-
-    model = load_model(MODEL_PATH, custom_objects={"LSTM": lstm_no_time_major})
-    with open(TOKENIZER_PATH, "r", encoding="utf-8") as f:
-        tokenizer = tokenizer_from_json(f.read())
-    scaler = joblib.load(SCALER_PATH)
-    le = joblib.load(LE_PATH)
-    print("✅ Model and preprocessing objects loaded successfully!")
-except Exception as e:
-    print("❌ Error loading model:", e)
-    model, tokenizer, scaler, le = None, None, None, None
-
+print("✅ Model and preprocessing objects loaded successfully!")
 
 # -------------------- FIRESTORE ASYNC HELPER --------------------
 def save_prediction_async(text, severity, confidence):
+    """Save prediction to Firestore asynchronously."""
     if not db:
+        print("⚠️ Firestore not initialized — skipping save.")
         return
     try:
         db.collection("api_predictions").add({
@@ -69,43 +69,42 @@ def save_prediction_async(text, severity, confidence):
             "confidence": confidence,
             "timestamp": datetime.utcnow().isoformat()
         })
+        print(f"📝 Saved prediction for text: {text[:30]}...")
     except Exception as e:
-        print("⚠️ Error saving prediction:", e)
-
+        print("❌ Error saving prediction:", e)
 
 # -------------------- ROUTES --------------------
 @app.route("/")
 def index():
     return redirect(url_for("dashboard"))
 
-
 @app.route("/dashboard")
 def dashboard():
+    """Displays PHQ-9 assessment results stored in Firestore."""
     if not db:
-        return "⚠️ Database unavailable.", 500
+        flash("Firestore not connected.", "error")
+        return render_template("phq9.html", assessments=[])
+    
     assessments_ref = db.collection("assessments").stream()
     assessments = [{**a.to_dict(), "id": a.id} for a in assessments_ref]
     return render_template("phq9.html", assessments=assessments)
 
-
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    if not model or not db:
-        flash("Model or database not available.")
-        return redirect(url_for("dashboard"))
+    """Handles PHQ-9 form submissions from frontend."""
+    text = request.form.get("text", "")
+    answers = [int(request.form.get(f"q{i}", 0)) for i in range(1, 10)]
+    total = sum(answers)
 
-    try:
-        text = request.form.get("text")
-        answers = [int(request.form.get(f"q{i}")) for i in range(1, 10)]
-        total = sum(answers)
+    scaled = np.array([answers]).reshape(1, -1)
+    scaled = scaler.transform(scaled)
+    seq = tokenizer.texts_to_sequences([text])
+    seq = pad_sequences(seq, maxlen=MAX_LEN)
 
-        scaled = scaler.transform(np.array([answers]))
-        seq = tokenizer.texts_to_sequences([text])
-        seq = pad_sequences(seq, maxlen=MAX_LEN)
+    pred = model.predict([seq, scaled])
+    severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
 
-        pred = model.predict([seq, scaled])
-        severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
-
+    if db:
         db.collection("assessments").add({
             "text": text,
             "severity": severity,
@@ -113,39 +112,38 @@ def analyze():
             "created_at": datetime.utcnow().isoformat()
         })
 
-        flash(f"AI Prediction: {severity} (PHQ-9 total: {total})")
-        return redirect(url_for("dashboard"))
-
-    except Exception as e:
-        flash(f"Error: {e}")
-        return redirect(url_for("dashboard"))
-
+    flash(f"AI Prediction: {severity} (PHQ-9 total: {total})")
+    return redirect(url_for("dashboard"))
 
 @app.route("/predict", methods=["POST"])
 def predict_api():
-    if not model:
-        return jsonify({"error": "Model not loaded"}), 500
-
+    """API endpoint for external predictions."""
     try:
-        data = request.get_json()
+        data = request.get_json(force=True)
         if not data or "text" not in data or "answers" not in data:
             return jsonify({"error": 'Missing "text" or "answers" in JSON body'}), 400
 
         text = data["text"]
         answers = data["answers"]
 
-        while len(answers) < 9:
-            answers.append(0)
-        answers = answers[:9]
-
+        # Pad or truncate to match scaler features
+        answers = (answers + [0] * SCALER_FEATURES)[:SCALER_FEATURES]
         scaled = scaler.transform(np.array([answers]))
+
+        # Pad for model if necessary
+        if scaled.shape[1] < MODEL_FEATURES:
+            scaled = np.append(scaled, np.zeros((1, MODEL_FEATURES - scaled.shape[1])), axis=1)
+
+        # Tokenize text input
         seq = tokenizer.texts_to_sequences([text])
         seq = pad_sequences(seq, maxlen=MAX_LEN)
 
+        # Prediction
         pred = model.predict([seq, scaled])
         severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
         confidence = float(np.max(pred))
 
+        # Save asynchronously
         threading.Thread(target=save_prediction_async, args=(text, severity, confidence)).start()
 
         return jsonify({
@@ -155,10 +153,10 @@ def predict_api():
         })
 
     except Exception as e:
+        print("❌ API Error:", e)
         return jsonify({"error": str(e)}), 500
 
-
-# -------------------- MAIN --------------------
+# -------------------- APP RUN --------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
