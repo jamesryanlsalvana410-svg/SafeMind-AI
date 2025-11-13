@@ -95,26 +95,43 @@ def predict_api():
         text = data['text']
         answers = data['answers']
 
-        scaled = np.array([answers]).reshape(1, -1)
-        scaled = scaler.transform(scaled)
+        # ---------------- Pad answers for scaler ----------------
+        SCALER_FEATURES = 9  # number of features scaler expects
+        while len(answers) < SCALER_FEATURES:
+            answers.append(0)  # pad missing features with 0
+        answers = answers[:SCALER_FEATURES]  # truncate if too long
+
+        # Scale input
+        scaled = scaler.transform(np.array([answers]))  # shape (1, SCALER_FEATURES)
+
+        # ---------------- Pad scaled for model ----------------
+        MODEL_FEATURES = 10  # number of features model expects
+        if scaled.shape[1] < MODEL_FEATURES:
+            # append dummy 0 for missing features
+            scaled = np.append(scaled, np.zeros((1, MODEL_FEATURES - scaled.shape[1])), axis=1)
+
+        # ---------------- Process text ----------------
         seq = tokenizer.texts_to_sequences([text])
         seq = pad_sequences(seq, maxlen=MAX_LEN)
 
+        # ---------------- Predict ----------------
         pred = model.predict([seq, scaled])
         severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
+        confidence = float(np.max(pred))
 
-        # Store prediction in Firestore
+        # ---------------- Store prediction in Firestore ----------------
         db.collection('api_predictions').add({
             'text': text,
             'severity': severity,
-            'confidence': float(np.max(pred)),
+            'confidence': confidence,
             'timestamp': datetime.utcnow().isoformat()
         })
 
         return jsonify({
             'severity': severity,
-            'confidence': float(np.max(pred))
+            'confidence': confidence
         })
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
