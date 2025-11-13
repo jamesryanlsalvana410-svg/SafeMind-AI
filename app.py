@@ -44,7 +44,6 @@ def lstm_no_time_major(*args, **kwargs):
     return LSTM(*args, **kwargs)
 
 model = load_model(model_path, custom_objects={"LSTM": lstm_no_time_major})
-
 with open(tokenizer_path, "r", encoding="utf-8") as f:
     tokenizer = tokenizer_from_json(f.read())
 
@@ -54,7 +53,7 @@ le = joblib.load(le_path)
 MAX_LEN = 100
 SCALER_FEATURES = 9
 MODEL_FEATURES = 10
-CACHE_TTL = 3600  # seconds, cache for 1 hour
+CACHE_TTL = 3600  # 1 hour cache
 
 print("✅ Model and preprocessing objects loaded successfully!")
 
@@ -77,54 +76,58 @@ def index():
 
 @app.route("/dashboard")
 def dashboard():
-    assessments_ref = db.collection("assessments").stream()
-    assessments = [{**a.to_dict(), "id": a.id} for a in assessments_ref]
+    cache_key = "dashboard_assessments"
+    cached = cache.get(cache_key)
+    if cached:
+        assessments = json.loads(cached)
+    else:
+        assessments_ref = db.collection("assessments").stream()
+        assessments = [{**a.to_dict(), "id": a.id} for a in assessments_ref]
+        cache.setex(cache_key, CACHE_TTL, json.dumps(assessments))
     return render_template("phq9.html", assessments=assessments)
 
-# -------------------- ANALYZE ROUTE WITH REDIS CACHING --------------------
 @app.route("/analyze", methods=["POST"])
 def analyze():
     text = request.form.get("text", "")
     answers = [int(request.form.get(f"q{i}", 0)) for i in range(1, 10)]
     total = sum(answers)
 
-    # ---------------- Generate cache key ----------------
+    # Redis cache key
     cache_key = hashlib.sha256(json.dumps({"text": text, "answers": answers}).encode()).hexdigest()
-
-    # ---------------- Check Redis cache ----------------
     cached = cache.get(cache_key)
     if cached:
-        result = json.loads(cached)
-        severity = result['severity']
-        total = result['score']
+        severity = json.loads(cached)["severity"]
     else:
-        # Preprocess inputs
-        scaled = np.array([answers]).reshape(1, -1)
-        scaled = scaler.transform(scaled)
+        # Pad and scale
+        answers = (answers + [0] * SCALER_FEATURES)[:SCALER_FEATURES]
+        scaled = scaler.transform(np.array([answers]))
+        if scaled.shape[1] < MODEL_FEATURES:
+            scaled = np.append(scaled, np.zeros((1, MODEL_FEATURES - scaled.shape[1])), axis=1)
         seq = tokenizer.texts_to_sequences([text])
         seq = pad_sequences(seq, maxlen=MAX_LEN)
 
-        # Predict severity
+        # Predict
         pred = model.predict([seq, scaled])
         severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
+        confidence = float(np.max(pred))
 
-        # Prepare result and cache
-        result = {
-            "severity": severity,
-            "score": total
-        }
-        cache.setex(cache_key, CACHE_TTL, json.dumps(result))
+        # Async save
+        threading.Thread(target=save_prediction_async, args=(text, severity, confidence)).start()
 
-    # Save to Firestore asynchronously
-    threading.Thread(
-        target=save_prediction_async,
-        args=(text, severity, float(np.max(pred)))
-    ).start()
+        # Save to Redis
+        cache.setex(cache_key, CACHE_TTL, json.dumps({"severity": severity, "confidence": confidence}))
+
+    # Save to Firestore
+    db.collection("assessments").add({
+        "text": text,
+        "severity": severity,
+        "score": float(total),
+        "created_at": datetime.utcnow().isoformat()
+    })
 
     flash(f"AI Prediction: {severity} (PHQ-9 total: {total})")
     return redirect(url_for("dashboard"))
 
-# -------------------- API PREDICT ROUTE --------------------
 @app.route("/predict", methods=["POST"])
 def predict_api():
     try:
@@ -135,7 +138,7 @@ def predict_api():
         text = data["text"]
         answers = data["answers"]
 
-        # Pad answers for scaler/model
+        # Pad answers
         answers = (answers + [0] * SCALER_FEATURES)[:SCALER_FEATURES]
         scaled = scaler.transform(np.array([answers]))
         if scaled.shape[1] < MODEL_FEATURES:
@@ -143,7 +146,7 @@ def predict_api():
         seq = tokenizer.texts_to_sequences([text])
         seq = pad_sequences(seq, maxlen=MAX_LEN)
 
-        # Generate Redis cache key
+        # Redis cache key
         cache_key = hashlib.sha256(json.dumps({"text": text, "answers": answers}).encode()).hexdigest()
         cached = cache.get(cache_key)
         if cached:
@@ -154,7 +157,7 @@ def predict_api():
         severity = le.inverse_transform(np.argmax(pred, axis=1))[0]
         confidence = float(np.max(pred))
 
-        # Async Firestore save
+        # Async save
         threading.Thread(target=save_prediction_async, args=(text, severity, confidence)).start()
 
         response = {
