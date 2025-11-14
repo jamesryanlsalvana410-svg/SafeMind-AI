@@ -7,6 +7,7 @@ import threading
 import hashlib
 import redis
 import joblib
+import uuid
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.layers import LSTM
@@ -56,7 +57,7 @@ META_PATH = os.path.join(MODEL_DIR, "safemind_meta.json")
 TOKENIZER_PATH = os.path.join(MODEL_DIR, "tokenizer_v2.pkl")
 
 # -----------------------------------------------------
-# LOAD METADATA + TOKENIZER ONCE
+# LOAD METADATA + TOKENIZER
 # -----------------------------------------------------
 with open(META_PATH, "r") as f:
     meta = json.load(f)
@@ -70,7 +71,7 @@ tokenizer = joblib.load(TOKENIZER_PATH)
 print("✅ Tokenizer loaded.")
 
 # -----------------------------------------------------
-# LOAD MODEL ONCE
+# LOAD MODEL
 # -----------------------------------------------------
 def lstm_no_time_major(*args, **kwargs):
     kwargs.pop("time_major", None)
@@ -82,46 +83,47 @@ print("✅ Model loaded.")
 # -----------------------------------------------------
 # FIRESTORE SAVE ASYNC
 # -----------------------------------------------------
-def save_prediction_async(text_data, numeric_data, severity, confidence, recommendation=None):
+def save_prediction_async(job_id, input_data, severity, confidence):
+    """Save prediction to Firestore and cache result in Redis"""
     try:
         db.collection("api_predictions").add({
-            "text_data": text_data,
-            "numeric_data": numeric_data,
+            "job_id": job_id,
+            "input_data": input_data,
             "severity": severity,
             "confidence": confidence,
-            "recommendation": recommendation,
+            "recommendation": get_recommendation(severity),
             "timestamp": datetime.utcnow().isoformat()
         })
+        # Store result in Redis
+        if cache:
+            cache.setex(job_id, CACHE_TTL, json.dumps({
+                "severity": severity,
+                "confidence": confidence,
+                "recommendation": get_recommendation(severity)
+            }))
     except Exception as e:
         print("❌ Firestore Async Error:", e)
 
 # -----------------------------------------------------
 # PREDICTION PIPELINE
 # -----------------------------------------------------
-def preprocess_and_predict_batch(input_list):
-    """
-    Accepts list of input dicts.
-    Returns list of tuples: [(severity, confidence), ...]
-    """
-    seqs, numerics = [], []
+def preprocess_and_predict(input_dict):
+    # ---- TEXT PROCESSING ----
+    text_string = " ".join([str(input_dict.get(col, "")) for col in TEXT_COLS])
+    seq = tokenizer.texts_to_sequences([text_string])
+    seq = pad_sequences(seq, maxlen=MAX_LEN)
 
-    for input_dict in input_list:
-        text_string = " ".join([str(input_dict.get(col, "")) for col in TEXT_COLS])
-        seqs.append(text_string)
-        numerics.append([float(input_dict.get(col, 0)) for col in NUM_COLS])
+    # ---- NUMERIC PROCESSING ----
+    numeric_list = [float(input_dict.get(col, 0)) for col in NUM_COLS]
+    X_num = np.array(numeric_list).reshape(1, -1)
 
-    seqs_padded = pad_sequences(tokenizer.texts_to_sequences(seqs), maxlen=MAX_LEN)
-    X_num = np.array(numerics)
+    # ---- PREDICT ----
+    pred = model.predict([seq, X_num], verbose=0)
+    idx = int(np.argmax(pred))
+    severity = LABEL_CLASSES[idx]
+    confidence = float(np.max(pred))
 
-    preds = model.predict([seqs_padded, X_num], verbose=0)
-    results = []
-    for pred in preds:
-        idx = int(np.argmax(pred))
-        severity = LABEL_CLASSES[idx]
-        confidence = float(np.max(pred))
-        results.append((severity, confidence))
-
-    return results
+    return severity, confidence
 
 # -----------------------------------------------------
 # ROUTES
@@ -142,90 +144,42 @@ def dashboard():
             cache.setex(cache_key, CACHE_TTL, json.dumps(assessments))
     return render_template("phq9.html", assessments=assessments)
 
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    input_dict = {col: request.form.get(col, "") for col in TEXT_COLS}
-    for col in NUM_COLS:
-        input_dict[col] = request.form.get(col, 0)
-
-    cache_key = hashlib.sha256(json.dumps(input_dict, sort_keys=True).encode()).hexdigest()
-
-    if cache and cache.get(cache_key):
-        cached_response = json.loads(cache.get(cache_key))
-        severity = cached_response["severity"]
-        recommendation = cached_response["recommendation"]
-        confidence = cached_response["confidence"]
-    else:
-        severity, confidence = preprocess_and_predict_batch([input_dict])[0]
-        recommendation = get_recommendation(severity)
-        threading.Thread(
-            target=save_prediction_async,
-            args=(input_dict, NUM_COLS, severity, confidence, recommendation)
-        ).start()
-        if cache:
-            cache.setex(
-                cache_key,
-                CACHE_TTL,
-                json.dumps({
-                    "severity": severity,
-                    "confidence": confidence,
-                    "recommendation": recommendation
-                })
-            )
-
-    db.collection("assessments").add({
-        **input_dict,
-        "severity": severity,
-        "confidence": confidence,
-        "recommendation": recommendation,
-        "created_at": datetime.utcnow().isoformat()
-    })
-
-    flash(f"AI Prediction: {severity} — Recommendation: {recommendation}")
-    return redirect(url_for("dashboard"))
-
+# -----------------------------
+# Background job prediction
+# -----------------------------
 @app.route("/predict", methods=["POST"])
 def predict_api():
     if not request.is_json:
         return jsonify({"error": "Expected JSON body"}), 400
 
-    data = request.get_json()
+    input_data = request.get_json()
+    # Generate a unique job ID
+    job_id = str(uuid.uuid4())
+    
+    # Return job ID immediately
+    threading.Thread(
+        target=lambda: run_prediction(job_id, input_data)
+    ).start()
+    
+    return jsonify({"job_id": job_id, "status": "processing"}), 202
 
-    # Single or batch input
-    input_list = data if isinstance(data, list) else [data]
+def run_prediction(job_id, input_data):
+    severity, confidence = preprocess_and_predict(input_data)
+    save_prediction_async(job_id, input_data, severity, confidence)
 
-    responses = []
-    for input_dict in input_list:
-        cache_key = hashlib.sha256(json.dumps(input_dict, sort_keys=True).encode()).hexdigest()
-        if cache and cache.get(cache_key):
-            cached = json.loads(cache.get(cache_key))
-            responses.append(cached)
-            continue
+# -----------------------------
+# Polling endpoint
+# -----------------------------
+@app.route("/status/<job_id>", methods=["GET"])
+def check_status(job_id):
+    if cache and cache.get(job_id):
+        return jsonify({"status": "completed", **json.loads(cache.get(job_id))})
+    else:
+        return jsonify({"status": "processing"}), 202
 
-        severity, confidence = preprocess_and_predict_batch([input_dict])[0]
-        recommendation = get_recommendation(severity)
-
-        threading.Thread(
-            target=save_prediction_async,
-            args=(input_dict, NUM_COLS, severity, confidence, recommendation)
-        ).start()
-
-        response_obj = {
-            "severity": severity,
-            "confidence": confidence,
-            "recommendation": recommendation
-        }
-
-        if cache:
-            cache.setex(cache_key, CACHE_TTL, json.dumps(response_obj))
-
-        responses.append(response_obj)
-
-    return jsonify(responses[0] if isinstance(data, dict) else responses)
-
-# -----------------------------------------------------
-# RUN
-# -----------------------------------------------------
+# -----------------------------
+# RUN APP
+# -----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
