@@ -11,6 +11,7 @@ pandas==2.2.2
 scikit-learn==1.5.1
 joblib==1.4.2
 matplotlib
+org.tensorflow:tensorflow-lite-select-tf-ops
 
 # --- PDF Reports ---
 fpdf==1.7.2
