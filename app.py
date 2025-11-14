@@ -4,18 +4,22 @@ import threading
 import hashlib
 import numpy as np
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 import redis
 import joblib
-import tensorflow as tf
+from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-import firebase_admin
-from firebase_admin import credentials, firestore
+from tensorflow.keras.layers import LSTM
+
+# -----------------------------
+# FORCE CPU (if no GPU available)
+# -----------------------------
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 # -----------------------------
 # APP SETUP
 # -----------------------------
-app = Flask(__name__)
+app = Flask(__name__)  # Fixed: should be __name__
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'devkey')
 
 # -----------------------------
@@ -33,6 +37,9 @@ def get_recommendation(severity):
 # -----------------------------
 # FIREBASE SETUP
 # -----------------------------
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 cred = credentials.Certificate("firebase-key.json")
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
@@ -46,14 +53,16 @@ cache = redis.from_url(REDIS_URL) if REDIS_URL else None
 CACHE_TTL = 3600  # 1 hour
 
 # -----------------------------
-# MODEL + TOKENIZER
+# MODEL + METADATA PATHS
 # -----------------------------
 MODEL_DIR = "model"
-TFLITE_MODEL_PATH = os.path.join(MODEL_DIR, "safemind_model_v2.tflite")
+MODEL_PATH = os.path.join(MODEL_DIR, "safemind_model_v2.keras")
 META_PATH = os.path.join(MODEL_DIR, "safemind_meta.json")
 TOKENIZER_PATH = os.path.join(MODEL_DIR, "tokenizer_v2.pkl")
 
-# Load metadata
+# -----------------------------
+# LOAD METADATA + TOKENIZER
+# -----------------------------
 with open(META_PATH, "r") as f:
     meta = json.load(f)
 
@@ -62,45 +71,37 @@ NUM_COLS = meta["num_cols"]
 LABEL_CLASSES = meta["label_classes"]
 MAX_LEN = meta["tokenizer_params"]["max_len"]
 
-# Load tokenizer
 tokenizer = joblib.load(TOKENIZER_PATH)
 print("✅ Tokenizer loaded.")
 
 # -----------------------------
-# LOAD TFLITE MODEL WITH FLEX DELEGATE
+# LOAD MODEL
 # -----------------------------
-interpreter = tf.lite.Interpreter(
-    model_path=TFLITE_MODEL_PATH,
-    experimental_delegates=[tf.lite.experimental.load_delegate("libtensorflowlite_flex_delegate.so")]
-)
-interpreter.allocate_tensors()
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
-print("✅ TFLite model loaded with Flex delegate.")
+def lstm_no_time_major(*args, **kwargs):
+    kwargs.pop("time_major", None)
+    return LSTM(*args, **kwargs)
+
+model = load_model(MODEL_PATH, compile=False, custom_objects={"LSTM": lstm_no_time_major})
+print("✅ Model loaded.")
 
 # -----------------------------
 # PREDICTION FUNCTION
 # -----------------------------
 def preprocess_and_predict(input_dict):
-    # Text preprocessing
+    # Text processing
     text_string = " ".join([str(input_dict.get(col, "")) for col in TEXT_COLS])
     seq = tokenizer.texts_to_sequences([text_string])
-    seq = pad_sequences(seq, maxlen=MAX_LEN, dtype=np.int32)
+    seq = pad_sequences(seq, maxlen=MAX_LEN)
 
-    # Numeric preprocessing
+    # Numeric processing
     numeric_list = [float(input_dict.get(col, 0)) for col in NUM_COLS]
-    X_num = np.array(numeric_list, dtype=np.float32).reshape(1, -1)
+    X_num = np.array(numeric_list).reshape(1, -1)
 
-    # Set tensors and run inference
-    interpreter.set_tensor(input_details[0]['index'], seq)
-    interpreter.set_tensor(input_details[1]['index'], X_num)
-    interpreter.invoke()
-
-    pred = interpreter.get_tensor(output_details[0]['index'])
-    idx = int(pred.argmax())
+    # Predict
+    pred = model.predict([seq, X_num], verbose=0)
+    idx = int(np.argmax(pred))
     severity = LABEL_CLASSES[idx]
-    confidence = float(pred.max())
-
+    confidence = float(np.max(pred))
     return severity, confidence
 
 # -----------------------------
@@ -135,6 +136,9 @@ def dashboard():
             cache.setex(cache_key, CACHE_TTL, json.dumps(assessments))
     return render_template("phq9.html", assessments=assessments)
 
+# -----------------------------
+# API: PREDICT (Instant Response)
+# -----------------------------
 @app.route("/predict", methods=["POST"])
 def predict_api():
     if not request.is_json:
@@ -157,13 +161,14 @@ def predict_api():
             "recommendation": recommendation
         }
 
-        # Cache result
+        # Cache result for future requests
         if cache:
             cache.setex(cache_key, CACHE_TTL, json.dumps(result))
 
-        # Save asynchronously
+        # Save asynchronously to Firestore
         threading.Thread(target=save_prediction_async, args=(input_data, result), daemon=True).start()
 
+        # Return prediction instantly
         return jsonify(result)
 
     except Exception as e:
@@ -173,6 +178,7 @@ def predict_api():
 # -----------------------------
 # RUN APP
 # -----------------------------
-if __name__ == "__main__":
+if __name__ == "__main__":  # Fixed: should be '__main__'
     port = int(os.environ.get("PORT", 5000))
+    # Enable Flask threaded mode for multiple simultaneous requests
     app.run(host="0.0.0.0", port=port, threaded=True)
