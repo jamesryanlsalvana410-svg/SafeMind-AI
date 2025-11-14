@@ -77,9 +77,9 @@ print("✅ Tokenizer loaded.")
 # LOAD TFLITE MODEL WITH FLEX DELEGATE
 # -----------------------------
 # Enable Flex delegate to support TensorFlow ops not natively in TFLite
-from tensorflow.lite.experimental import load_delegate
-flex_delegate = load_delegate('libtensorflowlite_flex.so')
+from tensorflow.lite.experimental.flex_delegate import FlexDelegate
 
+flex_delegate = FlexDelegate()
 interpreter = tf.lite.Interpreter(model_path=TFLITE_PATH, experimental_delegates=[flex_delegate])
 interpreter.allocate_tensors()
 
