@@ -3,11 +3,8 @@ from datetime import datetime
 import os
 import numpy as np
 import json
-import threading
-import hashlib
 import redis
 import joblib
-import uuid
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.layers import LSTM
@@ -81,33 +78,6 @@ model = load_model(MODEL_PATH, compile=False, custom_objects={"LSTM": lstm_no_ti
 print("✅ Model loaded.")
 
 # -----------------------------------------------------
-# FIRESTORE SAVE ASYNC
-# -----------------------------------------------------
-def save_prediction_async(job_id, input_data, severity, confidence):
-    """Save prediction to Firestore and cache result in Redis"""
-    try:
-        result = {
-            "severity": severity,
-            "confidence": confidence,
-            "recommendation": get_recommendation(severity)
-        }
-
-        # Save to Firestore
-        db.collection("api_predictions").add({
-            "job_id": job_id,
-            "input_data": input_data,
-            **result,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-
-        # Save to Redis
-        if cache:
-            cache.setex(job_id, CACHE_TTL, json.dumps(result))
-
-    except Exception as e:
-        print("❌ Firestore Async Error:", e)
-
-# -----------------------------------------------------
 # PREDICTION PIPELINE
 # -----------------------------------------------------
 def preprocess_and_predict(input_dict):
@@ -147,40 +117,51 @@ def dashboard():
             cache.setex(cache_key, CACHE_TTL, json.dumps(assessments))
     return render_template("phq9.html", assessments=assessments)
 
-# -----------------------------
-# Background job prediction
-# -----------------------------
+# -----------------------------------------------------
+# API: Synchronous Prediction
+# -----------------------------------------------------
 @app.route("/predict", methods=["POST"])
 def predict_api():
     if not request.is_json:
         return jsonify({"error": "Expected JSON body"}), 400
 
     input_data = request.get_json()
-    job_id = str(uuid.uuid4())
+    # Create a cache key based on input
+    cache_key = hashlib.sha256(json.dumps(input_data, sort_keys=True).encode()).hexdigest()
 
-    # Run prediction asynchronously
-    threading.Thread(target=run_prediction, args=(job_id, input_data), daemon=True).start()
-
-    # Return job_id immediately
-    return jsonify({"job_id": job_id, "status": "processing"}), 202
-
-def run_prediction(job_id, input_data):
-    severity, confidence = preprocess_and_predict(input_data)
-    save_prediction_async(job_id, input_data, severity, confidence)
-
-# -----------------------------
-# Polling endpoint
-# -----------------------------
-@app.route("/status/<job_id>", methods=["GET"])
-def check_status(job_id):
-    if cache and cache.get(job_id):
-        return jsonify({"status": "completed", **json.loads(cache.get(job_id))})
+    # Check Redis cache first
+    if cache and cache.get(cache_key):
+        result = json.loads(cache.get(cache_key))
     else:
-        return jsonify({"status": "processing"}), 202
+        # Run prediction
+        severity, confidence = preprocess_and_predict(input_data)
+        recommendation = get_recommendation(severity)
 
-# -----------------------------
+        result = {
+            "severity": severity,
+            "confidence": confidence,
+            "recommendation": recommendation
+        }
+
+        # Save to Redis cache
+        if cache:
+            cache.setex(cache_key, CACHE_TTL, json.dumps(result))
+
+        # Save to Firestore asynchronously
+        threading.Thread(
+            target=lambda: db.collection("api_predictions").add({
+                "input_data": input_data,
+                **result,
+                "timestamp": datetime.utcnow().isoformat()
+            }),
+            daemon=True
+        ).start()
+
+    return jsonify(result)
+
+# -----------------------------------------------------
 # RUN APP
-# -----------------------------
+# -----------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
