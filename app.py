@@ -2,198 +2,248 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from datetime import datetime
 import os
 import numpy as np
-import firebase_admin
-from firebase_admin import credentials, firestore
+import json
+import threading
+import hashlib
+import redis
+import joblib
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.layers import LSTM
-import joblib
-import threading
-import redis
-import hashlib
-import json
 
-# -------------------- APP SETUP --------------------
+# -----------------------------------------------------
+# APP SETUP
+# -----------------------------------------------------
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'devkey')
 
-# -------------------- FIREBASE INIT --------------------
+# -----------------------------------------------------
+# >>> ADDED: CLINICAL RECOMMENDATIONS
+# -----------------------------------------------------
+RECOMMENDATIONS = {
+    "low": (
+        "Your symptoms appear to be mild. Continue practicing healthy habits such as "
+        "sleep hygiene, physical activity, and connecting with supportive people. "
+        "Monitor your symptoms and seek help if they worsen or persist."
+    ),
+    "moderate": (
+        "Your symptoms appear to be moderate. It is recommended to speak with a "
+        "mental health professional or counselor for further evaluation. Early support "
+        "can help prevent symptoms from getting worse."
+    ),
+    "high": (
+        "Your symptoms appear to be severe. Please seek professional help as soon as "
+        "possible. If you are experiencing thoughts of self-harm or harming others, "
+        "contact emergency services or your local crisis hotline immediately."
+    )
+}
+
+def get_recommendation(severity):
+    return RECOMMENDATIONS.get(severity, "No recommendation available.")
+# -----------------------------------------------------
+
+
+# -----------------------------------------------------
+# FIREBASE SETUP
+# -----------------------------------------------------
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 cred = credentials.Certificate("firebase-key.json")
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# -------------------- REDIS INIT --------------------
-REDIS_URL = os.getenv("REDIS_URL")  # e.g., rediss://default:xxx@host:6379
-cache = redis.from_url(REDIS_URL)
+# -----------------------------------------------------
+# REDIS CACHE
+# -----------------------------------------------------
+REDIS_URL = os.getenv("REDIS_URL")
+cache = redis.from_url(REDIS_URL) if REDIS_URL else None
 
-# -------------------- MODEL VARIABLES --------------------
-MODEL_DIR = "model"
-model_path = os.path.join(MODEL_DIR, "safemind_model.h5")
-tokenizer_path = os.path.join(MODEL_DIR, "tokenizer.json")
-scaler_path = os.path.join(MODEL_DIR, "scaler.pkl")
-le_path = os.path.join(MODEL_DIR, "label_encoder.pkl")
-
-MAX_LEN = 100
-SCALER_FEATURES = 9
-MODEL_FEATURES = 10
 CACHE_TTL = 3600  # 1 hour
 
-# -------------------- LAZY LOADING --------------------
-_model = None
-_tokenizer = None
-_scaler = None
-_le = None
+# -----------------------------------------------------
+# MODEL + METADATA PATHS
+# -----------------------------------------------------
+MODEL_DIR = "model"
+MODEL_PATH = os.path.join(MODEL_DIR, "safemind_model.h5")
+META_PATH = os.path.join(MODEL_DIR, "safemind_meta.json")
+TOKENIZER_PATH = os.path.join(MODEL_DIR, "tokenizer.pkl")
 
+# -----------------------------------------------------
+# LOAD METADATA
+# -----------------------------------------------------
+with open(META_PATH, "r") as f:
+    meta = json.load(f)
+
+TEXT_COLS = meta["text_cols"]
+NUM_COLS = meta["num_cols"]
+LABEL_CLASSES = meta["label_classes"]
+MAX_LEN = meta["tokenizer_params"]["max_len"]
+
+# -----------------------------------------------------
+# LOAD TOKENIZER
+# -----------------------------------------------------
+tokenizer = joblib.load(TOKENIZER_PATH)
+
+# -----------------------------------------------------
+# FIX LSTM TIME_MAJOR
+# -----------------------------------------------------
 def lstm_no_time_major(*args, **kwargs):
     kwargs.pop("time_major", None)
     return LSTM(*args, **kwargs)
 
-def get_model():
-    global _model
-    if _model is None:
-        _model = load_model(model_path, custom_objects={"LSTM": lstm_no_time_major})
-    return _model
+# -----------------------------------------------------
+# LOAD MODEL
+# -----------------------------------------------------
+model = load_model(MODEL_PATH, custom_objects={"LSTM": lstm_no_time_major})
+print("✅ Model loaded successfully.")
 
-def get_tokenizer():
-    global _tokenizer
-    if _tokenizer is None:
-        from tensorflow.keras.preprocessing.text import tokenizer_from_json
-        with open(tokenizer_path, "r", encoding="utf-8") as f:
-            _tokenizer = tokenizer_from_json(f.read())
-    return _tokenizer
 
-def get_scaler():
-    global _scaler
-    if _scaler is None:
-        _scaler = joblib.load(scaler_path)
-    return _scaler
-
-def get_label_encoder():
-    global _le
-    if _le is None:
-        _le = joblib.load(le_path)
-    return _le
-
-# -------------------- FIRESTORE ASYNC HELPER --------------------
-def save_prediction_async(text, severity, confidence):
+# -----------------------------------------------------
+# BACKGROUND FIRESTORE SAVE
+# -----------------------------------------------------
+def save_prediction_async(text_data, numeric_data, severity, confidence):
     try:
         db.collection("api_predictions").add({
-            "text": text,
+            "text_data": text_data,
+            "numeric_data": numeric_data,
             "severity": severity,
             "confidence": confidence,
             "timestamp": datetime.utcnow().isoformat()
         })
     except Exception as e:
-        print("❌ Error saving prediction:", e)
+        print("❌ Async Firestore Error:", e)
 
-# -------------------- ROUTES --------------------
+
+# -----------------------------------------------------
+# PREDICTION PIPELINE
+# -----------------------------------------------------
+def preprocess_and_predict(input_dict):
+    # ---- TEXT PROCESSING ----
+    text_string = ""
+    for col in TEXT_COLS:
+        text_string += str(input_dict.get(col, "")) + " "
+
+    seq = tokenizer.texts_to_sequences([text_string])
+    seq = pad_sequences(seq, maxlen=MAX_LEN)
+
+    # ---- NUMERIC PROCESSING ----
+    numeric_list = []
+    for col in NUM_COLS:
+        try:
+            numeric_list.append(float(input_dict.get(col, 0)))
+        except:
+            numeric_list.append(0.0)
+
+    X_num = np.array(numeric_list).reshape(1, -1)
+
+    # ---- PREDICT ----
+    pred = model.predict([seq, X_num])
+    idx = np.argmax(pred, axis=1)[0]
+    severity = LABEL_CLASSES[idx]
+    confidence = float(np.max(pred))
+
+    return severity, confidence
+
+
+# -----------------------------------------------------
+# ROUTES
+# -----------------------------------------------------
 @app.route("/")
 def index():
     return redirect(url_for("dashboard"))
 
+
 @app.route("/dashboard")
 def dashboard():
     cache_key = "dashboard_assessments"
-    cached = cache.get(cache_key)
-    if cached:
-        assessments = json.loads(cached)
+
+    if cache and cache.get(cache_key):
+        assessments = json.loads(cache.get(cache_key))
     else:
-        assessments_ref = db.collection("assessments").stream()
-        assessments = [{**a.to_dict(), "id": a.id} for a in assessments_ref]
-        cache.setex(cache_key, CACHE_TTL, json.dumps(assessments))
+        docs = db.collection("assessments").stream()
+        assessments = [{**d.to_dict(), "id": d.id} for d in docs]
+
+        if cache:
+            cache.setex(cache_key, CACHE_TTL, json.dumps(assessments))
+
     return render_template("phq9.html", assessments=assessments)
 
+
+# -----------------------------------------------------
+# ANALYZE — FROM HTML FORM
+# -----------------------------------------------------
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    text = request.form.get("text", "")
-    answers = [int(request.form.get(f"q{i}", 0)) for i in range(1, 10)]
-    total = sum(answers)
+    input_dict = {}
 
-    # Redis cache key
-    cache_key = hashlib.sha256(json.dumps({"text": text, "answers": answers}).encode()).hexdigest()
-    cached = cache.get(cache_key)
-    if cached:
-        severity = json.loads(cached)["severity"]
-    else:
-        # Pad and scale
-        answers = (answers + [0] * SCALER_FEATURES)[:SCALER_FEATURES]
-        scaled = get_scaler().transform(np.array([answers]))
-        if scaled.shape[1] < MODEL_FEATURES:
-            scaled = np.append(scaled, np.zeros((1, MODEL_FEATURES - scaled.shape[1])), axis=1)
-        seq = get_tokenizer().texts_to_sequences([text])
-        seq = pad_sequences(seq, maxlen=MAX_LEN)
+    # Collect text fields
+    for col in TEXT_COLS:
+        input_dict[col] = request.form.get(col, "")
 
-        # Predict
-        pred = get_model().predict([seq, scaled])
-        severity = get_label_encoder().inverse_transform(np.argmax(pred, axis=1))[0]
-        confidence = float(np.max(pred))
+    # Collect numeric fields
+    for col in NUM_COLS:
+        input_dict[col] = request.form.get(col, 0)
 
-        # Async save
-        threading.Thread(target=save_prediction_async, args=(text, severity, confidence)).start()
+    # Make predictions
+    severity, confidence = preprocess_and_predict(input_dict)
 
-        # Save to Redis
-        cache.setex(cache_key, CACHE_TTL, json.dumps({"severity": severity, "confidence": confidence}))
+    # >>> ADDED: Get recommendation
+    recommendation = get_recommendation(severity)
 
-    # Save to Firestore
+    # Save into Firestore
     db.collection("assessments").add({
-        "text": text,
+        **input_dict,
         "severity": severity,
-        "score": float(total),
+        "confidence": confidence,
+        "recommendation": recommendation,   # <<< ADDED
         "created_at": datetime.utcnow().isoformat()
     })
 
-    flash(f"AI Prediction: {severity} (PHQ-9 total: {total})")
+    flash(f"AI Prediction: {severity} — Recommendation: {recommendation}")
     return redirect(url_for("dashboard"))
 
+
+# -----------------------------------------------------
+# PREDICT — JSON API
+# -----------------------------------------------------
 @app.route("/predict", methods=["POST"])
 def predict_api():
-    try:
-        data = request.get_json(force=True)
-        if not data or "text" not in data or "answers" not in data:
-            return jsonify({"error": 'Missing "text" or "answers" in JSON body'}), 400
+    if not request.is_json:
+        return jsonify({"error": "Expected JSON body"}), 400
 
-        text = data["text"]
-        answers = data["answers"]
+    data = request.get_json()
 
-        # Pad answers
-        answers = (answers + [0] * SCALER_FEATURES)[:SCALER_FEATURES]
-        scaled = get_scaler().transform(np.array([answers]))
-        if scaled.shape[1] < MODEL_FEATURES:
-            scaled = np.append(scaled, np.zeros((1, MODEL_FEATURES - scaled.shape[1])), axis=1)
-        seq = get_tokenizer().texts_to_sequences([text])
-        seq = pad_sequences(seq, maxlen=MAX_LEN)
+    # Create Cache Key
+    cache_key = hashlib.sha256(json.dumps(data).encode()).hexdigest()
+    if cache and cache.get(cache_key):
+        return jsonify(json.loads(cache.get(cache_key)))
 
-        # Redis cache key
-        cache_key = hashlib.sha256(json.dumps({"text": text, "answers": answers}).encode()).hexdigest()
-        cached = cache.get(cache_key)
-        if cached:
-            return jsonify(json.loads(cached))
+    # Predict
+    severity, confidence = preprocess_and_predict(data)
 
-        # Predict
-        pred = get_model().predict([seq, scaled])
-        severity = get_label_encoder().inverse_transform(np.argmax(pred, axis=1))[0]
-        confidence = float(np.max(pred))
+    # >>> ADDED: recommendation
+    recommendation = get_recommendation(severity)
 
-        # Async save
-        threading.Thread(target=save_prediction_async, args=(text, severity, confidence)).start()
+    # Async Firestore logging
+    threading.Thread(target=save_prediction_async, args=(data, NUM_COLS, severity, confidence)).start()
 
-        response = {
-            "severity": severity,
-            "confidence": confidence,
-            "message": "Prediction stored asynchronously"
-        }
+    response = {
+        "severity": severity,
+        "confidence": confidence,
+        "recommendation": recommendation    # <<< ADDED
+    }
 
-        # Store in Redis
+    if cache:
         cache.setex(cache_key, CACHE_TTL, json.dumps(response))
 
-        return jsonify(response)
+    return jsonify(response)
 
-    except Exception as e:
-        print("❌ API Error:", e)
-        return jsonify({"error": str(e)}), 500
 
-# -------------------- APP RUN --------------------
+# -----------------------------------------------------
+# RUN
+# -----------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
