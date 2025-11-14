@@ -4,7 +4,7 @@ import threading
 import hashlib
 import numpy as np
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 import redis
 import joblib
 import tensorflow as tf
@@ -75,17 +75,17 @@ interpreter = tf.lite.Interpreter(model_path=TFLITE_MODEL_PATH)
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
-print("✅ TFLite model loaded.")
+print("✅ TFLite Interpreter loaded")
 
 # -----------------------------
-# PREDICTION FUNCTION USING TFLITE
+# PREDICTION FUNCTION (TFLITE)
 # -----------------------------
-def preprocess_and_predict_tflite(input_dict):
-    # Text processing with caching
+def preprocess_and_predict(input_dict):
+    # --- Text processing with caching ---
     text_string = " ".join([str(input_dict.get(col, "")) for col in TEXT_COLS])
     text_hash = hashlib.sha256(text_string.encode()).hexdigest()
     seq_cache_key = f"seq_{text_hash}"
-
+    
     if cache and cache.get(seq_cache_key):
         seq = np.array(json.loads(cache.get(seq_cache_key)), dtype=np.int32)
     else:
@@ -93,23 +93,24 @@ def preprocess_and_predict_tflite(input_dict):
         seq = pad_sequences(seq, maxlen=MAX_LEN, dtype=np.int32)
         if cache:
             cache.setex(seq_cache_key, CACHE_TTL, json.dumps(seq.tolist()))
-
-    # Numeric processing
+    
+    # --- Numeric processing ---
     numeric_list = [float(input_dict.get(col, 0)) for col in NUM_COLS]
     X_num = np.array(numeric_list, dtype=np.float32).reshape(1, -1)
 
-    # Set inputs for TFLite
-    interpreter.set_tensor(input_details[0]['index'], seq.astype(np.float32))
-    interpreter.set_tensor(input_details[1]['index'], X_num.astype(np.float32))
+    # --- Set TFLite inputs ---
+    interpreter.set_tensor(input_details[0]['index'], seq)
+    interpreter.set_tensor(input_details[1]['index'], X_num)
 
-    # Run inference
+    # --- Run inference ---
     interpreter.invoke()
 
-    # Get output
+    # --- Get output ---
     pred = interpreter.get_tensor(output_details[0]['index'])
     idx = int(np.argmax(pred))
     severity = LABEL_CLASSES[idx]
     confidence = float(np.max(pred))
+
     return severity, confidence
 
 # -----------------------------
@@ -157,7 +158,7 @@ def predict_api():
         return jsonify(json.loads(cache.get(cache_key)))
 
     try:
-        severity, confidence = preprocess_and_predict_tflite(input_data)
+        severity, confidence = preprocess_and_predict(input_data)
         recommendation = get_recommendation(severity)
 
         result = {
@@ -173,7 +174,6 @@ def predict_api():
         # Save asynchronously to Firestore
         threading.Thread(target=save_prediction_async, args=(input_data, result), daemon=True).start()
 
-        # Return prediction instantly
         return jsonify(result)
 
     except Exception as e:
