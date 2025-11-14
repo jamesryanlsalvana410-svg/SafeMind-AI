@@ -86,21 +86,24 @@ print("✅ Model loaded.")
 def save_prediction_async(job_id, input_data, severity, confidence):
     """Save prediction to Firestore and cache result in Redis"""
     try:
+        result = {
+            "severity": severity,
+            "confidence": confidence,
+            "recommendation": get_recommendation(severity)
+        }
+
+        # Save to Firestore
         db.collection("api_predictions").add({
             "job_id": job_id,
             "input_data": input_data,
-            "severity": severity,
-            "confidence": confidence,
-            "recommendation": get_recommendation(severity),
+            **result,
             "timestamp": datetime.utcnow().isoformat()
         })
-        # Store result in Redis
+
+        # Save to Redis
         if cache:
-            cache.setex(job_id, CACHE_TTL, json.dumps({
-                "severity": severity,
-                "confidence": confidence,
-                "recommendation": get_recommendation(severity)
-            }))
+            cache.setex(job_id, CACHE_TTL, json.dumps(result))
+
     except Exception as e:
         print("❌ Firestore Async Error:", e)
 
@@ -153,14 +156,12 @@ def predict_api():
         return jsonify({"error": "Expected JSON body"}), 400
 
     input_data = request.get_json()
-    # Generate a unique job ID
     job_id = str(uuid.uuid4())
-    
-    # Return job ID immediately
-    threading.Thread(
-        target=lambda: run_prediction(job_id, input_data)
-    ).start()
-    
+
+    # Run prediction asynchronously
+    threading.Thread(target=run_prediction, args=(job_id, input_data), daemon=True).start()
+
+    # Return job_id immediately
     return jsonify({"job_id": job_id, "status": "processing"}), 202
 
 def run_prediction(job_id, input_data):
