@@ -10,7 +10,6 @@ import joblib
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.layers import LSTM
-from tensorflow.keras import Model
 
 # -----------------------------------------------------
 # APP SETUP
@@ -22,21 +21,9 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'devkey')
 # CLINICAL RECOMMENDATIONS
 # -----------------------------------------------------
 RECOMMENDATIONS = {
-    "low": (
-        "Your symptoms appear to be mild. Continue practicing healthy habits such as "
-        "sleep hygiene, physical activity, and connecting with supportive people. "
-        "Monitor your symptoms and seek help if they worsen or persist."
-    ),
-    "moderate": (
-        "Your symptoms appear to be moderate. It is recommended to speak with a "
-        "mental health professional or counselor for further evaluation. Early support "
-        "can help prevent symptoms from getting worse."
-    ),
-    "high": (
-        "Your symptoms appear to be severe. Please seek professional help as soon as "
-        "possible. If you are experiencing thoughts of self-harm or harming others, "
-        "contact emergency services or your local crisis hotline immediately."
-    )
+    "low": "Mild symptoms. Maintain healthy habits and monitor.",
+    "moderate": "Moderate symptoms. Consider professional support.",
+    "high": "Severe symptoms. Seek professional help immediately."
 }
 
 def get_recommendation(severity):
@@ -64,12 +51,12 @@ CACHE_TTL = 3600  # 1 hour
 # MODEL + METADATA PATHS
 # -----------------------------------------------------
 MODEL_DIR = "model"
-MODEL_PATH = os.path.join(MODEL_DIR, "safemind_model_v2.keras")   # Use Keras 3 native format
+MODEL_PATH = os.path.join(MODEL_DIR, "safemind_model_v2.keras")
 META_PATH = os.path.join(MODEL_DIR, "safemind_meta.json")
 TOKENIZER_PATH = os.path.join(MODEL_DIR, "tokenizer_v2.pkl")
 
 # -----------------------------------------------------
-# LOAD METADATA
+# LOAD METADATA + TOKENIZER ONCE
 # -----------------------------------------------------
 with open(META_PATH, "r") as f:
     meta = json.load(f)
@@ -79,27 +66,21 @@ NUM_COLS = meta["num_cols"]
 LABEL_CLASSES = meta["label_classes"]
 MAX_LEN = meta["tokenizer_params"]["max_len"]
 
-# -----------------------------------------------------
-# LOAD TOKENIZER
-# -----------------------------------------------------
 tokenizer = joblib.load(TOKENIZER_PATH)
-print("✅ Tokenizer loaded successfully.")
+print("✅ Tokenizer loaded.")
 
 # -----------------------------------------------------
-# FIX LSTM TIME_MAJOR
+# LOAD MODEL ONCE
 # -----------------------------------------------------
 def lstm_no_time_major(*args, **kwargs):
     kwargs.pop("time_major", None)
     return LSTM(*args, **kwargs)
 
-# -----------------------------------------------------
-# LOAD MODEL
-# -----------------------------------------------------
 model = load_model(MODEL_PATH, compile=False, custom_objects={"LSTM": lstm_no_time_major})
-print("✅ Model loaded successfully.")
+print("✅ Model loaded.")
 
 # -----------------------------------------------------
-# BACKGROUND FIRESTORE SAVE
+# FIRESTORE SAVE ASYNC
 # -----------------------------------------------------
 def save_prediction_async(text_data, numeric_data, severity, confidence):
     try:
@@ -111,7 +92,7 @@ def save_prediction_async(text_data, numeric_data, severity, confidence):
             "timestamp": datetime.utcnow().isoformat()
         })
     except Exception as e:
-        print("❌ Async Firestore Error:", e)
+        print("❌ Firestore Async Error:", e)
 
 # -----------------------------------------------------
 # PREDICTION PIPELINE
