@@ -108,8 +108,8 @@ def preprocess_and_predict(input_dict):
     numeric_list = [float(input_dict.get(col, 0)) for col in NUM_COLS]
     X_num = np.array(numeric_list).reshape(1, -1)
     
-    # Predict
-    pred = model.predict([seq, X_num], verbose=0)
+    # Predict - FIXED: Call the tf.function directly (no .predict method)
+    pred = model(tf.convert_to_tensor(seq), tf.convert_to_tensor(X_num))
     idx = int(np.argmax(pred))
     severity = LABEL_CLASSES[idx]
     confidence = float(np.max(pred))
