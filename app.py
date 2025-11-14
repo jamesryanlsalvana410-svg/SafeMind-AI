@@ -7,9 +7,8 @@ from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 import redis
 import joblib
-from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.layers import LSTM
+import tensorflow as tf  # For TFLite
 
 # -----------------------------
 # FORCE CPU (if no GPU available) - COMMENTED OUT TO ALLOW GPU IF AVAILABLE
@@ -56,7 +55,7 @@ CACHE_TTL = 3600  # 1 hour
 # MODEL + METADATA PATHS
 # -----------------------------
 MODEL_DIR = "model"
-MODEL_PATH = os.path.join(MODEL_DIR, "safemind_model_v2.keras")
+TFLITE_PATH = os.path.join(MODEL_DIR, "safemind_model_v2.tflite")  # Updated to TFLite
 META_PATH = os.path.join(MODEL_DIR, "safemind_meta.json")
 TOKENIZER_PATH = os.path.join(MODEL_DIR, "tokenizer_v2.pkl")
 
@@ -75,17 +74,19 @@ tokenizer = joblib.load(TOKENIZER_PATH)
 print("✅ Tokenizer loaded.")
 
 # -----------------------------
-# LOAD MODEL
+# LOAD TFLITE MODEL
 # -----------------------------
-def lstm_no_time_major(*args, **kwargs):
-    kwargs.pop("time_major", None)
-    return LSTM(*args, **kwargs)
+interpreter = tf.lite.Interpreter(model_path=TFLITE_PATH)
+interpreter.allocate_tensors()
 
-model = load_model(MODEL_PATH, compile=False, custom_objects={"LSTM": lstm_no_time_major})
-print("✅ Model loaded.")
+# Get input/output details
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+print("✅ TFLite Model loaded.")
 
 # -----------------------------
-# PREDICTION FUNCTION (ENHANCED CACHING)
+# PREDICTION FUNCTION (ENHANCED CACHING + TFLITE)
 # -----------------------------
 def preprocess_and_predict(input_dict):
     # Text processing with caching
@@ -94,19 +95,26 @@ def preprocess_and_predict(input_dict):
     seq_cache_key = f"seq_{text_hash}"
     
     if cache and cache.get(seq_cache_key):
-        seq = np.array(json.loads(cache.get(seq_cache_key)))
+        seq = np.array(json.loads(cache.get(seq_cache_key)), dtype=np.int32)
     else:
         seq = tokenizer.texts_to_sequences([text_string])
-        seq = pad_sequences(seq, maxlen=MAX_LEN)
+        seq = pad_sequences(seq, maxlen=MAX_LEN, dtype=np.int32)
         if cache:
             cache.setex(seq_cache_key, CACHE_TTL, json.dumps(seq.tolist()))
     
-    # Numeric processing (can add caching here if inputs vary little)
+    # Numeric processing
     numeric_list = [float(input_dict.get(col, 0)) for col in NUM_COLS]
-    X_num = np.array(numeric_list).reshape(1, -1)
+    X_num = np.array(numeric_list, dtype=np.float32).reshape(1, -1)
     
-    # Predict
-    pred = model.predict([seq, X_num], verbose=0)
+    # Set inputs for TFLite
+    interpreter.set_tensor(input_details[0]['index'], seq.astype(np.int32))  # Text input
+    interpreter.set_tensor(input_details[1]['index'], X_num.astype(np.float32))  # Numeric input
+    
+    # Invoke prediction
+    interpreter.invoke()
+    
+    # Get output
+    pred = interpreter.get_tensor(output_details[0]['index'])
     idx = int(np.argmax(pred))
     severity = LABEL_CLASSES[idx]
     confidence = float(np.max(pred))
