@@ -4,5 +4,5 @@ services:
     env: python
     region: singapore  # or 'oregon', 'frankfurt' — whichever is closer to you
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app --workers 1 --threads 2 --timeout 60"
+    startCommand: "gunicorn app:app --workers 1 --threads 2 --timeout 300 --preload"
     plan: free
