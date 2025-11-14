@@ -136,13 +136,44 @@ def dashboard():
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
+    # ---- Collect form data ----
     input_dict = {col: request.form.get(col, "") for col in TEXT_COLS}
     for col in NUM_COLS:
         input_dict[col] = request.form.get(col, 0)
 
-    severity, confidence = preprocess_and_predict(input_dict)
-    recommendation = get_recommendation(severity)
+    # ---- Generate Redis cache key ----
+    cache_key = hashlib.sha256(json.dumps(input_dict, sort_keys=True).encode()).hexdigest()
 
+    # ---- Check cache first ----
+    if cache and cache.get(cache_key):
+        cached_response = json.loads(cache.get(cache_key))
+        severity = cached_response["severity"]
+        recommendation = cached_response["recommendation"]
+        confidence = cached_response["confidence"]
+    else:
+        # ---- Predict using model ----
+        severity, confidence = preprocess_and_predict(input_dict)
+        recommendation = get_recommendation(severity)
+
+        # ---- Async Firestore save ----
+        threading.Thread(
+            target=save_prediction_async,
+            args=(input_dict, NUM_COLS, severity, confidence)
+        ).start()
+
+        # ---- Store in Redis ----
+        if cache:
+            cache.setex(
+                cache_key,
+                CACHE_TTL,
+                json.dumps({
+                    "severity": severity,
+                    "confidence": confidence,
+                    "recommendation": recommendation
+                })
+            )
+
+    # ---- Save to assessments collection ----
     db.collection("assessments").add({
         **input_dict,
         "severity": severity,
@@ -160,14 +191,17 @@ def predict_api():
         return jsonify({"error": "Expected JSON body"}), 400
 
     data = request.get_json()
-    cache_key = hashlib.sha256(json.dumps(data).encode()).hexdigest()
+    cache_key = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
     if cache and cache.get(cache_key):
         return jsonify(json.loads(cache.get(cache_key)))
 
     severity, confidence = preprocess_and_predict(data)
     recommendation = get_recommendation(severity)
 
-    threading.Thread(target=save_prediction_async, args=(data, NUM_COLS, severity, confidence)).start()
+    threading.Thread(
+        target=save_prediction_async,
+        args=(data, NUM_COLS, severity, confidence)
+    ).start()
 
     response = {
         "severity": severity,
