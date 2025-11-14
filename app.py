@@ -10,7 +10,6 @@ import joblib
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.layers import LSTM
-import tensorflow as tf  # Added for optimizations
 
 # -----------------------------
 # FORCE CPU (if no GPU available) - COMMENTED OUT TO ALLOW GPU IF AVAILABLE
@@ -83,9 +82,7 @@ def lstm_no_time_major(*args, **kwargs):
     return LSTM(*args, **kwargs)
 
 model = load_model(MODEL_PATH, compile=False, custom_objects={"LSTM": lstm_no_time_major})
-# OPTIMIZATION: Wrap in tf.function for faster inference (graph mode)
-model = tf.function(model)
-print("✅ Model loaded and optimized.")
+print("✅ Model loaded.")
 
 # -----------------------------
 # PREDICTION FUNCTION (ENHANCED CACHING)
@@ -108,8 +105,8 @@ def preprocess_and_predict(input_dict):
     numeric_list = [float(input_dict.get(col, 0)) for col in NUM_COLS]
     X_num = np.array(numeric_list).reshape(1, -1)
     
-    # Predict - FIXED: Call the tf.function directly (no .predict method)
-    pred = model(tf.convert_to_tensor(seq), tf.convert_to_tensor(X_num))
+    # Predict
+    pred = model.predict([seq, X_num], verbose=0)
     idx = int(np.argmax(pred))
     severity = LABEL_CLASSES[idx]
     confidence = float(np.max(pred))
