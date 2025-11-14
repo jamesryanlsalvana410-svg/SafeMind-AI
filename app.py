@@ -74,16 +74,20 @@ tokenizer = joblib.load(TOKENIZER_PATH)
 print("✅ Tokenizer loaded.")
 
 # -----------------------------
-# LOAD TFLITE MODEL
+# LOAD TFLITE MODEL WITH FLEX DELEGATE
 # -----------------------------
-interpreter = tf.lite.Interpreter(model_path=TFLITE_PATH)
+# Enable Flex delegate to support TensorFlow ops not natively in TFLite
+from tensorflow.lite.experimental import load_delegate
+flex_delegate = load_delegate('libtensorflowlite_flex.so')
+
+interpreter = tf.lite.Interpreter(model_path=TFLITE_PATH, experimental_delegates=[flex_delegate])
 interpreter.allocate_tensors()
 
 # Get input/output details
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-print("✅ TFLite Model loaded.")
+print("✅ TFLite Model loaded with Flex delegate.")
 
 # -----------------------------
 # PREDICTION FUNCTION (ENHANCED CACHING + TFLITE)
