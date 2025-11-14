@@ -82,13 +82,14 @@ print("✅ Model loaded.")
 # -----------------------------------------------------
 # FIRESTORE SAVE ASYNC
 # -----------------------------------------------------
-def save_prediction_async(text_data, numeric_data, severity, confidence):
+def save_prediction_async(text_data, numeric_data, severity, confidence, recommendation=None):
     try:
         db.collection("api_predictions").add({
             "text_data": text_data,
             "numeric_data": numeric_data,
             "severity": severity,
             "confidence": confidence,
+            "recommendation": recommendation,
             "timestamp": datetime.utcnow().isoformat()
         })
     except Exception as e:
@@ -97,23 +98,30 @@ def save_prediction_async(text_data, numeric_data, severity, confidence):
 # -----------------------------------------------------
 # PREDICTION PIPELINE
 # -----------------------------------------------------
-def preprocess_and_predict(input_dict):
-    # ---- TEXT PROCESSING ----
-    text_string = " ".join([str(input_dict.get(col, "")) for col in TEXT_COLS])
-    seq = tokenizer.texts_to_sequences([text_string])
-    seq = pad_sequences(seq, maxlen=MAX_LEN)
+def preprocess_and_predict_batch(input_list):
+    """
+    Accepts list of input dicts.
+    Returns list of tuples: [(severity, confidence), ...]
+    """
+    seqs, numerics = [], []
 
-    # ---- NUMERIC PROCESSING ----
-    numeric_list = [float(input_dict.get(col, 0)) for col in NUM_COLS]
-    X_num = np.array(numeric_list).reshape(1, -1)
+    for input_dict in input_list:
+        text_string = " ".join([str(input_dict.get(col, "")) for col in TEXT_COLS])
+        seqs.append(text_string)
+        numerics.append([float(input_dict.get(col, 0)) for col in NUM_COLS])
 
-    # ---- PREDICT ----
-    pred = model.predict([seq, X_num], verbose=0)
-    idx = int(np.argmax(pred))
-    severity = LABEL_CLASSES[idx]
-    confidence = float(np.max(pred))
+    seqs_padded = pad_sequences(tokenizer.texts_to_sequences(seqs), maxlen=MAX_LEN)
+    X_num = np.array(numerics)
 
-    return severity, confidence
+    preds = model.predict([seqs_padded, X_num], verbose=0)
+    results = []
+    for pred in preds:
+        idx = int(np.argmax(pred))
+        severity = LABEL_CLASSES[idx]
+        confidence = float(np.max(pred))
+        results.append((severity, confidence))
+
+    return results
 
 # -----------------------------------------------------
 # ROUTES
@@ -136,32 +144,24 @@ def dashboard():
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    # ---- Collect form data ----
     input_dict = {col: request.form.get(col, "") for col in TEXT_COLS}
     for col in NUM_COLS:
         input_dict[col] = request.form.get(col, 0)
 
-    # ---- Generate Redis cache key ----
     cache_key = hashlib.sha256(json.dumps(input_dict, sort_keys=True).encode()).hexdigest()
 
-    # ---- Check cache first ----
     if cache and cache.get(cache_key):
         cached_response = json.loads(cache.get(cache_key))
         severity = cached_response["severity"]
         recommendation = cached_response["recommendation"]
         confidence = cached_response["confidence"]
     else:
-        # ---- Predict using model ----
-        severity, confidence = preprocess_and_predict(input_dict)
+        severity, confidence = preprocess_and_predict_batch([input_dict])[0]
         recommendation = get_recommendation(severity)
-
-        # ---- Async Firestore save ----
         threading.Thread(
             target=save_prediction_async,
-            args=(input_dict, NUM_COLS, severity, confidence)
+            args=(input_dict, NUM_COLS, severity, confidence, recommendation)
         ).start()
-
-        # ---- Store in Redis ----
         if cache:
             cache.setex(
                 cache_key,
@@ -173,7 +173,6 @@ def analyze():
                 })
             )
 
-    # ---- Save to assessments collection ----
     db.collection("assessments").add({
         **input_dict,
         "severity": severity,
@@ -191,28 +190,38 @@ def predict_api():
         return jsonify({"error": "Expected JSON body"}), 400
 
     data = request.get_json()
-    cache_key = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
-    if cache and cache.get(cache_key):
-        return jsonify(json.loads(cache.get(cache_key)))
 
-    severity, confidence = preprocess_and_predict(data)
-    recommendation = get_recommendation(severity)
+    # Single or batch input
+    input_list = data if isinstance(data, list) else [data]
 
-    threading.Thread(
-        target=save_prediction_async,
-        args=(data, NUM_COLS, severity, confidence)
-    ).start()
+    responses = []
+    for input_dict in input_list:
+        cache_key = hashlib.sha256(json.dumps(input_dict, sort_keys=True).encode()).hexdigest()
+        if cache and cache.get(cache_key):
+            cached = json.loads(cache.get(cache_key))
+            responses.append(cached)
+            continue
 
-    response = {
-        "severity": severity,
-        "confidence": confidence,
-        "recommendation": recommendation
-    }
+        severity, confidence = preprocess_and_predict_batch([input_dict])[0]
+        recommendation = get_recommendation(severity)
 
-    if cache:
-        cache.setex(cache_key, CACHE_TTL, json.dumps(response))
+        threading.Thread(
+            target=save_prediction_async,
+            args=(input_dict, NUM_COLS, severity, confidence, recommendation)
+        ).start()
 
-    return jsonify(response)
+        response_obj = {
+            "severity": severity,
+            "confidence": confidence,
+            "recommendation": recommendation
+        }
+
+        if cache:
+            cache.setex(cache_key, CACHE_TTL, json.dumps(response_obj))
+
+        responses.append(response_obj)
+
+    return jsonify(responses[0] if isinstance(data, dict) else responses)
 
 # -----------------------------------------------------
 # RUN
