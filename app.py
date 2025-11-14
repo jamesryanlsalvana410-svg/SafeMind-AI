@@ -4,11 +4,13 @@ import threading
 import hashlib
 import numpy as np
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask import Flask, render_template, request, redirect, url_for, jsonify
 import redis
 import joblib
 import tensorflow as tf
 from tensorflow.keras.preprocessing.sequence import pad_sequences
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # -----------------------------
 # APP SETUP
@@ -31,9 +33,6 @@ def get_recommendation(severity):
 # -----------------------------
 # FIREBASE SETUP
 # -----------------------------
-import firebase_admin
-from firebase_admin import credentials, firestore
-
 cred = credentials.Certificate("firebase-key.json")
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
@@ -47,16 +46,14 @@ cache = redis.from_url(REDIS_URL) if REDIS_URL else None
 CACHE_TTL = 3600  # 1 hour
 
 # -----------------------------
-# MODEL + METADATA PATHS
+# MODEL + TOKENIZER
 # -----------------------------
 MODEL_DIR = "model"
 TFLITE_MODEL_PATH = os.path.join(MODEL_DIR, "safemind_model_v2.tflite")
 META_PATH = os.path.join(MODEL_DIR, "safemind_meta.json")
 TOKENIZER_PATH = os.path.join(MODEL_DIR, "tokenizer_v2.pkl")
 
-# -----------------------------
-# LOAD METADATA + TOKENIZER
-# -----------------------------
+# Load metadata
 with open(META_PATH, "r") as f:
     meta = json.load(f)
 
@@ -65,51 +62,44 @@ NUM_COLS = meta["num_cols"]
 LABEL_CLASSES = meta["label_classes"]
 MAX_LEN = meta["tokenizer_params"]["max_len"]
 
+# Load tokenizer
 tokenizer = joblib.load(TOKENIZER_PATH)
 print("✅ Tokenizer loaded.")
 
 # -----------------------------
-# LOAD TFLITE MODEL
+# LOAD TFLITE MODEL WITH FLEX DELEGATE
 # -----------------------------
-interpreter = tf.lite.Interpreter(model_path=TFLITE_MODEL_PATH)
+interpreter = tf.lite.Interpreter(
+    model_path=TFLITE_MODEL_PATH,
+    experimental_delegates=[tf.lite.experimental.load_delegate("libtensorflowlite_flex_delegate.so")]
+)
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
-print("✅ TFLite Interpreter loaded")
+print("✅ TFLite model loaded with Flex delegate.")
 
 # -----------------------------
-# PREDICTION FUNCTION (TFLITE)
+# PREDICTION FUNCTION
 # -----------------------------
 def preprocess_and_predict(input_dict):
-    # --- Text processing with caching ---
+    # Text preprocessing
     text_string = " ".join([str(input_dict.get(col, "")) for col in TEXT_COLS])
-    text_hash = hashlib.sha256(text_string.encode()).hexdigest()
-    seq_cache_key = f"seq_{text_hash}"
-    
-    if cache and cache.get(seq_cache_key):
-        seq = np.array(json.loads(cache.get(seq_cache_key)), dtype=np.int32)
-    else:
-        seq = tokenizer.texts_to_sequences([text_string])
-        seq = pad_sequences(seq, maxlen=MAX_LEN, dtype=np.int32)
-        if cache:
-            cache.setex(seq_cache_key, CACHE_TTL, json.dumps(seq.tolist()))
-    
-    # --- Numeric processing ---
+    seq = tokenizer.texts_to_sequences([text_string])
+    seq = pad_sequences(seq, maxlen=MAX_LEN, dtype=np.int32)
+
+    # Numeric preprocessing
     numeric_list = [float(input_dict.get(col, 0)) for col in NUM_COLS]
     X_num = np.array(numeric_list, dtype=np.float32).reshape(1, -1)
 
-    # --- Set TFLite inputs ---
+    # Set tensors and run inference
     interpreter.set_tensor(input_details[0]['index'], seq)
     interpreter.set_tensor(input_details[1]['index'], X_num)
-
-    # --- Run inference ---
     interpreter.invoke()
 
-    # --- Get output ---
     pred = interpreter.get_tensor(output_details[0]['index'])
-    idx = int(np.argmax(pred))
+    idx = int(pred.argmax())
     severity = LABEL_CLASSES[idx]
-    confidence = float(np.max(pred))
+    confidence = float(pred.max())
 
     return severity, confidence
 
@@ -167,11 +157,11 @@ def predict_api():
             "recommendation": recommendation
         }
 
-        # Cache result for future requests
+        # Cache result
         if cache:
             cache.setex(cache_key, CACHE_TTL, json.dumps(result))
 
-        # Save asynchronously to Firestore
+        # Save asynchronously
         threading.Thread(target=save_prediction_async, args=(input_data, result), daemon=True).start()
 
         return jsonify(result)
