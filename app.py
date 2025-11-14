@@ -8,7 +8,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 import redis
 import joblib
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-import tensorflow as tf  # For TFLite
+import tensorflow as tf
 
 # -----------------------------
 # FORCE CPU (if no GPU available) - COMMENTED OUT TO ALLOW GPU IF AVAILABLE
@@ -55,7 +55,7 @@ CACHE_TTL = 3600  # 1 hour
 # MODEL + METADATA PATHS
 # -----------------------------
 MODEL_DIR = "model"
-TFLITE_PATH = os.path.join(MODEL_DIR, "safemind_model_v2.tflite")  # Updated to TFLite
+MODEL_PATH = os.path.join(MODEL_DIR, "safemind_model_v2.h5")  # Assuming the model is saved as .h5; adjust if it's a SavedModel directory
 META_PATH = os.path.join(MODEL_DIR, "safemind_meta.json")
 TOKENIZER_PATH = os.path.join(MODEL_DIR, "tokenizer_v2.pkl")
 
@@ -74,23 +74,13 @@ tokenizer = joblib.load(TOKENIZER_PATH)
 print("✅ Tokenizer loaded.")
 
 # -----------------------------
-# LOAD TFLITE MODEL WITH FLEX DELEGATE
+# LOAD FULL TENSORFLOW MODEL
 # -----------------------------
-# Enable Flex delegate to support TensorFlow ops not natively in TFLite
-from tensorflow.lite.experimental.flex_delegate import FlexDelegate
-
-flex_delegate = FlexDelegate()
-interpreter = tf.lite.Interpreter(model_path=TFLITE_PATH, experimental_delegates=[flex_delegate])
-interpreter.allocate_tensors()
-
-# Get input/output details
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
-
-print("✅ TFLite Model loaded with Flex delegate.")
+model = tf.keras.models.load_model(MODEL_PATH)
+print("✅ Full TensorFlow Model loaded.")
 
 # -----------------------------
-# PREDICTION FUNCTION (ENHANCED CACHING + TFLITE)
+# PREDICTION FUNCTION (ENHANCED CACHING + FULL MODEL)
 # -----------------------------
 def preprocess_and_predict(input_dict):
     # Text processing with caching
@@ -110,15 +100,8 @@ def preprocess_and_predict(input_dict):
     numeric_list = [float(input_dict.get(col, 0)) for col in NUM_COLS]
     X_num = np.array(numeric_list, dtype=np.float32).reshape(1, -1)
     
-    # Set inputs for TFLite
-    interpreter.set_tensor(input_details[0]['index'], seq.astype(np.int32))  # Text input
-    interpreter.set_tensor(input_details[1]['index'], X_num.astype(np.float32))  # Numeric input
-    
-    # Invoke prediction
-    interpreter.invoke()
-    
-    # Get output
-    pred = interpreter.get_tensor(output_details[0]['index'])
+    # Prediction with full model
+    pred = model.predict([seq, X_num], verbose=0)
     idx = int(np.argmax(pred))
     severity = LABEL_CLASSES[idx]
     confidence = float(np.max(pred))
