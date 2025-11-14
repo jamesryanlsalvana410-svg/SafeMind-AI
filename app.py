@@ -6,10 +6,13 @@ import json
 import threading
 import hashlib
 import redis
-import joblib
+import pickle
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.layers import LSTM
+import sys
+import types
+import keras.preprocessing
 
 # -----------------------------------------------------
 # APP SETUP
@@ -18,7 +21,7 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'devkey')
 
 # -----------------------------------------------------
-# >>> ADDED: CLINICAL RECOMMENDATIONS
+# >>> CLINICAL RECOMMENDATIONS
 # -----------------------------------------------------
 RECOMMENDATIONS = {
     "low": (
@@ -40,8 +43,6 @@ RECOMMENDATIONS = {
 
 def get_recommendation(severity):
     return RECOMMENDATIONS.get(severity, "No recommendation available.")
-# -----------------------------------------------------
-
 
 # -----------------------------------------------------
 # FIREBASE SETUP
@@ -59,7 +60,6 @@ db = firestore.client()
 # -----------------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL")
 cache = redis.from_url(REDIS_URL) if REDIS_URL else None
-
 CACHE_TTL = 3600  # 1 hour
 
 # -----------------------------------------------------
@@ -82,9 +82,13 @@ LABEL_CLASSES = meta["label_classes"]
 MAX_LEN = meta["tokenizer_params"]["max_len"]
 
 # -----------------------------------------------------
-# LOAD TOKENIZER
+# SAFE TOKENIZER LOAD
 # -----------------------------------------------------
-tokenizer = joblib.load(TOKENIZER_PATH)
+# Patch old path for pickled tokenizers (fixes ModuleNotFoundError)
+sys.modules['keras.src.preprocessing'] = keras.preprocessing
+
+with open(TOKENIZER_PATH, "rb") as f:
+    tokenizer = pickle.load(f)
 
 # -----------------------------------------------------
 # FIX LSTM TIME_MAJOR
@@ -98,7 +102,6 @@ def lstm_no_time_major(*args, **kwargs):
 # -----------------------------------------------------
 model = load_model(MODEL_PATH, custom_objects={"LSTM": lstm_no_time_major})
 print("✅ Model loaded successfully.")
-
 
 # -----------------------------------------------------
 # BACKGROUND FIRESTORE SAVE
@@ -114,7 +117,6 @@ def save_prediction_async(text_data, numeric_data, severity, confidence):
         })
     except Exception as e:
         print("❌ Async Firestore Error:", e)
-
 
 # -----------------------------------------------------
 # PREDICTION PIPELINE
@@ -146,14 +148,12 @@ def preprocess_and_predict(input_dict):
 
     return severity, confidence
 
-
 # -----------------------------------------------------
 # ROUTES
 # -----------------------------------------------------
 @app.route("/")
 def index():
     return redirect(url_for("dashboard"))
-
 
 @app.route("/dashboard")
 def dashboard():
@@ -169,7 +169,6 @@ def dashboard():
             cache.setex(cache_key, CACHE_TTL, json.dumps(assessments))
 
     return render_template("phq9.html", assessments=assessments)
-
 
 # -----------------------------------------------------
 # ANALYZE — FROM HTML FORM
@@ -189,7 +188,7 @@ def analyze():
     # Make predictions
     severity, confidence = preprocess_and_predict(input_dict)
 
-    # >>> ADDED: Get recommendation
+    # Get recommendation
     recommendation = get_recommendation(severity)
 
     # Save into Firestore
@@ -197,13 +196,12 @@ def analyze():
         **input_dict,
         "severity": severity,
         "confidence": confidence,
-        "recommendation": recommendation,   # <<< ADDED
+        "recommendation": recommendation,
         "created_at": datetime.utcnow().isoformat()
     })
 
     flash(f"AI Prediction: {severity} — Recommendation: {recommendation}")
     return redirect(url_for("dashboard"))
-
 
 # -----------------------------------------------------
 # PREDICT — JSON API
@@ -223,7 +221,7 @@ def predict_api():
     # Predict
     severity, confidence = preprocess_and_predict(data)
 
-    # >>> ADDED: recommendation
+    # Get recommendation
     recommendation = get_recommendation(severity)
 
     # Async Firestore logging
@@ -232,14 +230,13 @@ def predict_api():
     response = {
         "severity": severity,
         "confidence": confidence,
-        "recommendation": recommendation    # <<< ADDED
+        "recommendation": recommendation
     }
 
     if cache:
         cache.setex(cache_key, CACHE_TTL, json.dumps(response))
 
     return jsonify(response)
-
 
 # -----------------------------------------------------
 # RUN
