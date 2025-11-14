@@ -4,16 +4,11 @@ import threading
 import hashlib
 import numpy as np
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask import Flask, render_template, request, redirect, url_for, jsonify
 import redis
 import joblib
-from tensorflow.keras.preprocessing.sequence import pad_sequences
 import tensorflow as tf
-
-# -----------------------------
-# FORCE CPU (if no GPU available) - COMMENTED OUT TO ALLOW GPU IF AVAILABLE
-# -----------------------------
-# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Uncomment if you want to force CPU
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 # -----------------------------
 # APP SETUP
@@ -55,7 +50,7 @@ CACHE_TTL = 3600  # 1 hour
 # MODEL + METADATA PATHS
 # -----------------------------
 MODEL_DIR = "model"
-MODEL_PATH = os.path.join(MODEL_DIR, "safemind_model_v2.h5")  # Assuming the model is saved as .h5; adjust if it's a SavedModel directory
+TFLITE_MODEL_PATH = os.path.join(MODEL_DIR, "safemind_model_v2.tflite")
 META_PATH = os.path.join(MODEL_DIR, "safemind_meta.json")
 TOKENIZER_PATH = os.path.join(MODEL_DIR, "tokenizer_v2.pkl")
 
@@ -74,20 +69,23 @@ tokenizer = joblib.load(TOKENIZER_PATH)
 print("✅ Tokenizer loaded.")
 
 # -----------------------------
-# LOAD FULL TENSORFLOW MODEL
+# LOAD TFLITE MODEL
 # -----------------------------
-model = tf.keras.models.load_model(MODEL_PATH)
-print("✅ Full TensorFlow Model loaded.")
+interpreter = tf.lite.Interpreter(model_path=TFLITE_MODEL_PATH)
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+print("✅ TFLite model loaded.")
 
 # -----------------------------
-# PREDICTION FUNCTION (ENHANCED CACHING + FULL MODEL)
+# PREDICTION FUNCTION USING TFLITE
 # -----------------------------
-def preprocess_and_predict(input_dict):
+def preprocess_and_predict_tflite(input_dict):
     # Text processing with caching
     text_string = " ".join([str(input_dict.get(col, "")) for col in TEXT_COLS])
     text_hash = hashlib.sha256(text_string.encode()).hexdigest()
     seq_cache_key = f"seq_{text_hash}"
-    
+
     if cache and cache.get(seq_cache_key):
         seq = np.array(json.loads(cache.get(seq_cache_key)), dtype=np.int32)
     else:
@@ -95,13 +93,20 @@ def preprocess_and_predict(input_dict):
         seq = pad_sequences(seq, maxlen=MAX_LEN, dtype=np.int32)
         if cache:
             cache.setex(seq_cache_key, CACHE_TTL, json.dumps(seq.tolist()))
-    
+
     # Numeric processing
     numeric_list = [float(input_dict.get(col, 0)) for col in NUM_COLS]
     X_num = np.array(numeric_list, dtype=np.float32).reshape(1, -1)
-    
-    # Prediction with full model
-    pred = model.predict([seq, X_num], verbose=0)
+
+    # Set inputs for TFLite
+    interpreter.set_tensor(input_details[0]['index'], seq.astype(np.float32))
+    interpreter.set_tensor(input_details[1]['index'], X_num.astype(np.float32))
+
+    # Run inference
+    interpreter.invoke()
+
+    # Get output
+    pred = interpreter.get_tensor(output_details[0]['index'])
     idx = int(np.argmax(pred))
     severity = LABEL_CLASSES[idx]
     confidence = float(np.max(pred))
@@ -139,9 +144,6 @@ def dashboard():
             cache.setex(cache_key, CACHE_TTL, json.dumps(assessments))
     return render_template("phq9.html", assessments=assessments)
 
-# -----------------------------
-# API: PREDICT (Instant Response)
-# -----------------------------
 @app.route("/predict", methods=["POST"])
 def predict_api():
     if not request.is_json:
@@ -155,7 +157,7 @@ def predict_api():
         return jsonify(json.loads(cache.get(cache_key)))
 
     try:
-        severity, confidence = preprocess_and_predict(input_data)
+        severity, confidence = preprocess_and_predict_tflite(input_data)
         recommendation = get_recommendation(severity)
 
         result = {
@@ -183,5 +185,4 @@ def predict_api():
 # -----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    # Enable Flask threaded mode for multiple simultaneous requests
     app.run(host="0.0.0.0", port=port, threaded=True)

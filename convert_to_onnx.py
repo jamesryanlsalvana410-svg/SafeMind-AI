@@ -1,31 +1,22 @@
-import tf2onnx
 import tensorflow as tf
-from tensorflow.keras.models import load_model
-from tensorflow.keras.layers import LSTM
 
-# Load your model
-MODEL_PATH = "model/safemind_model_v2.keras"
+model_path = "model/safemind_model_v2.h5"
+model = tf.keras.models.load_model(model_path)
 
-def lstm_no_time_major(*args, **kwargs):
-    kwargs.pop("time_major", None)
-    return LSTM(*args, **kwargs)
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
 
-model = load_model(MODEL_PATH, compile=False, custom_objects={"LSTM": lstm_no_time_major})
+# Fallback to TF ops for unsupported ops like LSTM dynamic TensorArray
+converter.target_spec.supported_ops = [
+    tf.lite.OpsSet.TFLITE_BUILTINS,      # default TFLite ops
+    tf.lite.OpsSet.SELECT_TF_OPS         # select TF ops
+]
 
-# Define input signatures (adjust based on your model's inputs)
-# Check your meta.json for MAX_LEN and len(NUM_COLS), or run model.summary()
-# Example: If MAX_LEN=100 and NUM_COLS has 5 features
-spec = (
-    tf.TensorSpec((None, 100), tf.int32, name="text_input"),  # Replace 100 with your MAX_LEN
-    tf.TensorSpec((None, 5), tf.float32, name="num_input")    # Replace 5 with len(NUM_COLS)
-)
+# Optional: do not lower TensorList ops (may help)
+converter._experimental_lower_tensor_list_ops = False
 
-# Convert to ONNX
-onnx_model, _ = tf2onnx.convert.from_keras(model, input_signature=spec, opset=13)
+tflite_model = converter.convert()
 
-# Save ONNX model
-ONNX_PATH = "model/safemind_model_v2.onnx"
-with open(ONNX_PATH, "wb") as f:
-    f.write(onnx_model.SerializeToString())
+with open("model/safemind_model_v2.tflite", "wb") as f:
+    f.write(tflite_model)
 
-print(f"✅ ONNX model saved to {ONNX_PATH}")
+print("✅ TFLite model saved with SELECT_TF_OPS fallback")
