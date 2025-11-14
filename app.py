@@ -152,63 +152,40 @@ def dashboard():
 # -----------------------------
 @app.route("/predict", methods=["POST"])
 def predict_api():
-    start_total = time.time()
-    
-    # Log initial resource usage
-    cpu_before = psutil.cpu_percent(interval=None)
-    mem_before = psutil.virtual_memory().percent
-    
     if not request.is_json:
         return jsonify({"error": "Expected JSON body"}), 400
-    
-    # Add input size limit to prevent large payloads (adjust as needed)
-    if request.content_length and request.content_length > 10 * 1024 * 1024:  # 10MB limit
-        return jsonify({"error": "Input too large"}), 413
-    
+
     input_data = request.get_json()
     cache_key = hashlib.sha256(json.dumps(input_data, sort_keys=True).encode()).hexdigest()
-    
+
     # Return cached result if exists
     if cache and cache.get(cache_key):
-        cached_result = json.loads(cache.get(cache_key))
-        print(f"Cache hit for key {cache_key[:8]}... Total time: {time.time() - start_total:.2f}s")
-        return jsonify(cached_result)
-    
+        return jsonify(json.loads(cache.get(cache_key)))
+
     try:
-        # Time preprocessing and prediction
-        start_predict = time.time()
-        severity, confidence = preprocess_and_predict(input_data)  # Pass model if needed: preprocess_and_predict(input_data, model)
-        predict_time = time.time() - start_predict
-        print(f"Preprocess and predict took: {predict_time:.2f}s")
-        
-        # Time recommendation
-        start_rec = time.time()
+        severity, confidence = preprocess_and_predict(input_data)
         recommendation = get_recommendation(severity)
-        rec_time = time.time() - start_rec
-        print(f"Recommendation took: {rec_time:.2f}s")
-        
+
         result = {
             "severity": severity,
             "confidence": confidence,
             "recommendation": recommendation
         }
-        
-        # Cache the result (your original code was missing this!)
+
+        # Cache result for future requests
         if cache:
-            cache.set(cache_key, json.dumps(result), timeout=3600)  # Cache for 1 hour
-        
-        # Log total time and resource usage
-        total_time = time.time() - start_total
-        cpu_after = psutil.cpu_percent(interval=None)
-        mem_after = psutil.virtual_memory().percent
-        print(f"Total response time: {total_time:.2f}s | CPU: {cpu_before:.1f}% -> {cpu_after:.1f}% | Mem: {mem_before:.1f}% -> {mem_after:.1f}%")
-        
+            cache.setex(cache_key, CACHE_TTL, json.dumps(result))
+
+        # Save asynchronously to Firestore
+        threading.Thread(target=save_prediction_async, args=(input_data, result), daemon=True).start()
+
+        # Return prediction instantly
         return jsonify(result)
-    
+
     except Exception as e:
-        # Log errors to prevent silent failures
-        print(f"Error in prediction: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+        print("❌ Prediction Error:", e)
+        return jsonify({"error": "Prediction failed", "details": str(e)}), 500
+
 # -----------------------------
 # RUN APP
 # -----------------------------
