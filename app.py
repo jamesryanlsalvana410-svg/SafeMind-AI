@@ -12,7 +12,7 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.layers import LSTM
 
 # -----------------------------
-# FORCE CPU (Render may not have GPU)
+# FORCE CPU (if no GPU available)
 # -----------------------------
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
@@ -50,7 +50,7 @@ db = firestore.client()
 # -----------------------------
 REDIS_URL = os.getenv("REDIS_URL")
 cache = redis.from_url(REDIS_URL) if REDIS_URL else None
-CACHE_TTL = 3600
+CACHE_TTL = 3600  # 1 hour
 
 # -----------------------------
 # MODEL + METADATA PATHS
@@ -105,6 +105,19 @@ def preprocess_and_predict(input_dict):
     return severity, confidence
 
 # -----------------------------
+# FIRESTORE ASYNC SAVE
+# -----------------------------
+def save_prediction_async(input_data, result):
+    try:
+        db.collection("api_predictions").add({
+            "input_data": input_data,
+            **result,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        print("❌ Firestore Async Error:", e)
+
+# -----------------------------
 # ROUTES
 # -----------------------------
 @app.route("/")
@@ -124,7 +137,7 @@ def dashboard():
     return render_template("phq9.html", assessments=assessments)
 
 # -----------------------------
-# API: PREDICT
+# API: PREDICT (Instant Response)
 # -----------------------------
 @app.route("/predict", methods=["POST"])
 def predict_api():
@@ -134,7 +147,7 @@ def predict_api():
     input_data = request.get_json()
     cache_key = hashlib.sha256(json.dumps(input_data, sort_keys=True).encode()).hexdigest()
 
-    # Check cache
+    # Return cached result if exists
     if cache and cache.get(cache_key):
         return jsonify(json.loads(cache.get(cache_key)))
 
@@ -148,20 +161,14 @@ def predict_api():
             "recommendation": recommendation
         }
 
-        # Cache result
+        # Cache result for future requests
         if cache:
             cache.setex(cache_key, CACHE_TTL, json.dumps(result))
 
-        # Save to Firestore asynchronously
-        threading.Thread(
-            target=lambda: db.collection("api_predictions").add({
-                "input_data": input_data,
-                **result,
-                "timestamp": datetime.utcnow().isoformat()
-            }),
-            daemon=True
-        ).start()
+        # Save asynchronously to Firestore
+        threading.Thread(target=save_prediction_async, args=(input_data, result), daemon=True).start()
 
+        # Return prediction instantly
         return jsonify(result)
 
     except Exception as e:
@@ -169,8 +176,9 @@ def predict_api():
         return jsonify({"error": "Prediction failed", "details": str(e)}), 500
 
 # -----------------------------
-# RUN
+# RUN APP
 # -----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    # Enable Flask threaded mode for multiple simultaneous requests
+    app.run(host="0.0.0.0", port=port, threaded=True)
